@@ -56,6 +56,91 @@ For memory footprint reduction, we will use concept similar to Deepseek MHLA.
 - $\alpha = softmax(S)$
 - $A = \alpha \times V = (\alpha_i \times L_{KV}) \times W_V^L$
 
+## Backpropagation
+
+### A. Focus Attention: Closed-Form Softmax VJP & Gradients
+
+Given:
+$$M = \frac{Q^T K}{\sqrt{d_h}} \in \mathbb{R}^{d_h \times d_h}, \quad S = \text{softmax}(M) \in \mathbb{R}^{d_h \times d_h}, \quad A = V S \in \mathbb{R}^{C \times d_h}$$
+
+Incoming upstream gradient: $G_A = \nabla_A \mathcal{L} = \frac{\partial \mathcal{L}}{\partial A}$
+
+1. **Gradient w.r.t $V$ and $S$**:
+   $$\nabla_V \mathcal{L} = G_A S^T$$
+   $$G_S = \nabla_S \mathcal{L} = V^T G_A$$
+
+2. **Softmax VJP (Eliminates building explicit Jacobian matrices)**:
+   For row-wise softmax $S_{r, :}$, the exact VJP for row $r$ is:
+   $$\nabla_M \mathcal{L} = S \odot \left( G_S - \sum_k (G_S \odot S) \right) = S \odot \Big( G_S - \text{rowsum}(G_S \odot S) \Big)$$
+
+3. **Gradient w.r.t $Q$ and $K$**:
+   $$\nabla_Q \mathcal{L} = \frac{1}{\sqrt{d_h}} K (\nabla_M \mathcal{L})^T$$
+   $$\nabla_K \mathcal{L} = \frac{1}{\sqrt{d_h}} Q (\nabla_M \mathcal{L})$$
+
+---
+
+### B. Retention: Reverse Cumulative Scan & Latent-KV Backprop
+
+In forward pass:
+$$P_i = \phi\left(\frac{Q_i K^T}{\sqrt{D_{KQV}}}\right), \quad S_i = S_{i-1} + P_i = \sum_{t=1}^i P_t, \quad \alpha_i = \text{softmax}(S_i), \quad A_i = \alpha_i V$$
+
+$P_t$ is simply an **alias (shorthand notation)** for the new token contribution at step $t$:
+
+$$P_t = \phi\left( \frac{Q_t \times K^T}{\sqrt{d}} \right)$$
+
+---
+
+### 1. Why is it written as $\sum_{t=1}^i P_t$?
+
+When we unroll your recursive formula step by step:
+
+- **Step 1 ($i=1$):**  
+  $$S_1 = P_1$$
+- **Step 2 ($i=2$):**  
+  $$S_2 = S_1 + P_2 = P_1 + P_2$$
+- **Step 3 ($i=3$):**  
+  $$S_3 = S_2 + P_3 = P_1 + P_2 + P_3$$
+- **Step $i$:**  
+  $$S_i = S_{i-1} + P_i = P_1 + P_2 + \dots + P_i = \sum_{t=1}^i P_t$$
+
+Here, $t$ is just the **dummy summation index running from time $t = 1$ to $t = i$**. It represents all past history accumulated up to step $i$.
+
+---
+
+### 2. Why is this unrolling crucial for backpropagation?
+
+This unrolling directly explains the **triangular gradient accumulation**:
+
+1. **In the Forward Pass**: Step $i$'s feature $P_i$ is added to $S_i$, which stays alive in all subsequent states:
+   $$S_i, \; S_{i+1}, \; S_{i+2}, \; \dots, \; S_C$$
+
+2. **In the Backward Pass (Chain Rule)**:
+   Because $\frac{\partial S_k}{\partial P_i} = 1$ for all $k \ge i$, the total gradient for token $i$'s feature $P_i$ is:
+   $$\frac{\partial \mathcal{L}}{\partial P_i} = \sum_{k=i}^{C} \frac{\partial \mathcal{L}}{\partial S_k} \underbrace{\frac{\partial S_k}{\partial P_i}}_{= 1} = \sum_{k=i}^{C} \frac{\partial \mathcal{L}}{\partial S_k}$$
+
+This is why token $i$ receives the sum of gradients from tokens $i$ to $i+j$. Using $P_t$ allows this sum to be computed across the whole sequence simultaneously as a **reverse prefix/suffix sum** (or cumulative scan) without slow loops.
+
+In backward pass, because token $i$ feeds into all downstream states $S_i, S_{i+1}, \dots, S_{i+j}$, the gradient with respect to step $i$'s contribution $P_i$ is the **reverse cumulative sum (suffix sum)** across future tokens:
+
+$$\nabla_{P_i} \mathcal{L} = \sum_{k=i}^{C} \nabla_{S_k} \mathcal{L}$$
+
+1. **Softmax VJP on $\alpha_i$**:
+   $$G_{\alpha_i} = (\nabla_{A_i} \mathcal{L}) V^T$$
+   $$\nabla_{S_i} \mathcal{L} = \alpha_i \odot \Big( G_{\alpha_i} - \text{sum}(G_{\alpha_i} \odot \alpha_i) \Big)$$
+
+2. **Vectorized Reverse Suffix Scan (No slow for-loops)**:
+   $$\nabla_P \mathcal{L} = \text{flip}\Big(\text{cumsum}(\text{flip}(\nabla_S \mathcal{L}, \text{dim}=C), \text{dim}=C)\Big)$$
+
+3. **Backprop through $\phi$ (e.g. SiLU $\phi(x) = x \cdot \sigma(x)$)**:
+   $$\phi'(x) = \sigma(x) \cdot \big(1 + x \cdot (1 - \sigma(x))\big)$$
+   $$G_{\text{score}} = \nabla_P \mathcal{L} \odot \phi'(\text{score})$$
+
+4. **Gradients w.r.t $Q, K, V$ and Latent Weights**:
+   $$\nabla_Q \mathcal{L} = \frac{1}{\sqrt{D_{KQV}}} G_{\text{score}} K, \quad \nabla_K \mathcal{L} = \frac{1}{\sqrt{D_{KQV}}} G_{\text{score}}^T Q, \quad \nabla_V \mathcal{L} = \alpha^T (\nabla_A \mathcal{L})$$
+   $$\nabla_{L_{KV}} \mathcal{L} = \nabla_K \mathcal{L} (W_K^L)^T + \nabla_V \mathcal{L} (W_V^L)^T$$
+   $$\nabla_{W_{KV}^L} = X^T (\nabla_{L_{KV}} \mathcal{L}), \quad \nabla_{W_K^L} = L_{KV}^T (\nabla_K \mathcal{L}), \quad \nabla_{W_V^L} = L_{KV}^T (\nabla_V \mathcal{L})$$
+
+
 ---
 
 ## Mock-D1
