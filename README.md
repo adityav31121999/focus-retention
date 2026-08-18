@@ -139,3 +139,11 @@ Token injection maintains the continuity of original information, while residual
 - **Shared Embeddings ($W_{emb}$)**: ~0.805 Billion Parameters
 - **LoRA De-Embedding Head ($r=256$)**: ~0.068 Billion Parameters
 - **Total Model Parameters**: **~6.588 Billion Parameters** (~6.6B Class / **Mock-D1:7B**)
+
+
+## 25B and 100B
+
+- These will be reasoning and MoE models. Experts are routed gates, not complete projection weights.
+- In these variants, the FFN has gates for up-projection along with experts. We will use these gates as experts, not complete FFNs.
+- Each expert is fetched via router through output vectors of each layer.
+- Number of shared experts are less than experts. Shared expert is pre-fetched by using system prompt from multiple shared experts. This will be refered to as system expert.
