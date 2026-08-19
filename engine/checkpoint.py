@@ -7,7 +7,21 @@ class CheckpointManager:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
+    def save_raw(self, step: int, model_state: dict, optim_state: dict, scheduler_state: dict, loss: float):
+        """Saves pre-consolidated state dictionaries (used by FSDP)."""
+        path = os.path.join(self.output_dir, f"checkpoint_step_{step}.pt")
+        state = {
+            "step": step,
+            "model_state": model_state,
+            "optimizer_state": optim_state,
+            "scheduler_state": scheduler_state,
+            "loss": loss,
+        }
+        torch.save(state, path)
+        print(f"[Checkpoint] Saved consolidated FSDP checkpoint to {path}")
+
     def save(self, step: int, model: nn.Module, optimizer: torch.optim.Optimizer, scheduler, loss: float):
+        """Standard save for Single-GPU and DDP."""
         path = os.path.join(self.output_dir, f"checkpoint_step_{step}.pt")
         state = {
             "step": step,
