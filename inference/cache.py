@@ -24,9 +24,8 @@ class MockD1StateCache:
                     dtype=torch.float32
                 )
                 block_states.append(m_state)
-            # 1 Retention state
-            s_state = torch.zeros((self.batch_size, 1, 1), device=self.device, dtype=torch.float32)
-            block_states.append(s_state)
+            # 1 Retention state (dictionary containing 'l_kv_cache' and 'running_S')
+            block_states.append({})
             cache.append(block_states)
         return cache
 

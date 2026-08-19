@@ -1,6 +1,6 @@
 import pytest
 import torch
-from mock_d1.focus import FocusAttentionFunction
+from mock_d1.focus import DecayedFocusAttentionFunction
 from mock_d1.retention import RetentionFunction
 
 def test_focus_attention_gradcheck():
@@ -12,11 +12,12 @@ def test_focus_attention_gradcheck():
     q = torch.randn(B, H, C, d_h, dtype=torch.float64, requires_grad=True)
     k = torch.randn(B, H, C, d_h, dtype=torch.float64, requires_grad=True)
     v = torch.randn(B, H, C, d_h, dtype=torch.float64, requires_grad=True)
+    gamma = torch.rand(1, H, 1, 1, dtype=torch.float64, requires_grad=True)
 
     # PyTorch gradcheck tests analytical vs numerical gradients
-    passed = torch.autograd.gradcheck(FocusAttentionFunction.apply, (q, k, v, scale), eps=1e-6, atol=1e-4)
+    passed = torch.autograd.gradcheck(DecayedFocusAttentionFunction.apply, (q, k, v, gamma, scale), eps=1e-6, atol=1e-4)
     assert passed, "Focus Attention analytical gradients failed gradcheck!"
-    print("✅ Focus Attention Gradcheck Passed!")
+    print("[PASS] Focus Attention Gradcheck Passed!")
 
 def test_retention_gradcheck():
     torch.manual_seed(42)
@@ -29,7 +30,7 @@ def test_retention_gradcheck():
 
     passed = torch.autograd.gradcheck(RetentionFunction.apply, (q, k, v, scale, "silu"), eps=1e-6, atol=1e-4)
     assert passed, "Retention analytical gradients failed gradcheck!"
-    print("✅ Retention Gradcheck Passed!")
+    print("[PASS] Retention Gradcheck Passed!")
 
 if __name__ == "__main__":
     test_focus_attention_gradcheck()

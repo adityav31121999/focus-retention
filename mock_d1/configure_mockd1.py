@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+
 @dataclass
 class MockD1Config:
     # General Dimensions
@@ -15,12 +16,16 @@ class MockD1Config:
     focus_layers_per_block: int = 3         # N_F (27 Focus layers total)
     retention_layers_per_block: int = 1     # N_R (9 Retention layers total)
 
-    # Focus Attention
+    # Focus Attention + RoPE & Decay
     focus_heads: int = 32                   # N_H (d_h = 4096 / 32 = 128)
+    use_rope: bool = True                   # Enable Rotary Position Embeddings
+    rope_base: float = 500_000.0            # High base frequency for 262k context
+    use_focus_decay: bool = True            # Enable learnable head-specific temporal decay
 
-    # Retention Attention
+    # Retention Attention (Exact Associative Memory)
     retention_heads: int = 1
     retention_latent_dim: int = 512         # d_L (Latent KV cache dimension)
+    retention_decay: float = 0.9            # Causal discount factor lambda
     phi_act: str = "silu"
 
     # Embeddings & LoRA De-Embedding Head

@@ -1,11 +1,11 @@
+from typing import Any
 import torch
 import torch.nn.functional as F
 from mock_d1.model_mock import MockD1ForCausalLM
-from data.tokeniser import TokenizerManager
 from .cache import MockD1StateCache
 
 class MockD1Generator:
-    def __init__(self, model: MockD1ForCausalLM, tokenizer: TokenizerManager, device: str = "cuda"):
+    def __init__(self, model: MockD1ForCausalLM, tokenizer: Any, device: str = "cuda"):
         self.model = model.to(device).eval()
         self.tokenizer = tokenizer
         self.device = device

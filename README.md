@@ -32,6 +32,8 @@ Following is the breakdown:
 
 This is similar to linear attention, but instead of $QK^TV$, we take $VQ^TK$. If we look closely, this almost looks similar, instead of doing feature extractions, we apply softmax. The content is also in `K` and `Q`, if we have to go by standard definition, this will blur the past, but if we consider this as new mechanism, and ignore the standard vanilla transformer, this attention is doing same thing as linear attention but more on vanilla standard manner.
 
+> Added Decay Factor ($\gamma$) for $M_{i-1}$ so that we do not accumulate all past and corrup the future predictions.
+
 ---
 
 ## RETENTION MECHANISM
@@ -55,6 +57,8 @@ For memory footprint reduction, we will use concept similar to Deepseek MHLA.
 - $S_i = S_{i-1} + \phi(Q \times K^T) = S_{i-1} + \phi(Q \times (X \times W_{KV}^L)^T) = S_{i-1} + \phi((Q \times W_{KV}^{LT}) \times L_{KV}^T)$
 - $\alpha = softmax(S)$
 - $A = \alpha \times V = (\alpha_i \times L_{KV}) \times W_V^L$
+
+> We only take latent representatin of Keys and Values, not Queries.
 
 ## Backpropagation
 

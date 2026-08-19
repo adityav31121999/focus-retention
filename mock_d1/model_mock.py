@@ -9,6 +9,21 @@ from .feedforward import RMSNorm
 from .block import MockD1Block
 
 
+def init_laplace_weights_(tensor: torch.Tensor, scale: float = 0.02, min_val: float = -1.0, max_val: float = 1.0):
+    """
+    Initializes tensor in-place with Laplace distribution centered at 0.0
+    and clamped to the range (min_val, max_val).
+    """
+    with torch.no_grad():
+        laplace = torch.distributions.Laplace(
+            loc=torch.tensor(0.0, dtype=tensor.dtype, device=tensor.device),
+            scale=torch.tensor(scale, dtype=tensor.dtype, device=tensor.device)
+        )
+        sample = laplace.sample(tensor.shape)
+        tensor.copy_(sample.clamp_(min_val, max_val))
+    return tensor
+
+
 class MockD1LoRADeEmbeddingHead(nn.Module):
     """
     De-Embedding Head with Shared Base Embeddings and LoRA Residual:
@@ -26,7 +41,7 @@ class MockD1LoRADeEmbeddingHead(nn.Module):
             # Low-rank factor B: [r, VocabSize] = [256, 262144]
             self.lora_B = nn.Parameter(torch.empty(self.r, config.vocab_size))
             
-            nn.init.normal_(self.lora_A, mean=0.0, std=config.initializer_range)
+            init_laplace_weights_(self.lora_A, scale=config.initializer_range, min_val=-1.0, max_val=1.0)
             nn.init.zeros_(self.lora_B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -100,11 +115,11 @@ class MockD1ForCausalLM(nn.Module):
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            init_laplace_weights_(module.weight, scale=self.config.initializer_range, min_val=-1.0, max_val=1.0)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            init_laplace_weights_(module.weight, scale=self.config.initializer_range, min_val=-1.0, max_val=1.0)
 
     def gradient_checkpointing_enable(self):
         """Enables activation checkpointing across all transformer blocks."""
