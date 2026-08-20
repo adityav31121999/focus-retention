@@ -1,6 +1,6 @@
 # Focus Retention Architecture
 
-This repository is for experimental **focus-retention** architecture. Using this, we will train and 7B parameter model.
+This repository is for experimental **focus-retention** architecture. Using this, we will train a 7B parameter model.
 
 ## FOCUS ATTENTION
 
@@ -274,9 +274,7 @@ Token injection maintains the continuity of original information, while residual
 - **Layer 2**:
     - $W_2 = D_{FFN} \times D_E = 12,288 \times 3,072$
 
----
-
-### Parameter Count Summary
+#### Parameter Count Summary
 - **Backbone (36 Layers)**: ~5.714 Billion Parameters
 - **Shared Embeddings ($W_{emb}$)**: ~0.805 Billion Parameters
 - **LoRA De-Embedding Head ($r=256$)**: ~0.068 Billion Parameters
@@ -290,3 +288,39 @@ Token injection maintains the continuity of original information, while residual
 - In these variants, the FFN has gates for up-projection along with experts. We will use these gates as experts, not complete FFNs.
 - Each expert is fetched via router through output vectors of each layer.
 - Number of shared experts are less than experts. Shared expert is pre-fetched by using system prompt from multiple shared experts. This will be refered to as system expert.
+
+---
+
+## For Kaggle Notebook based training
+
+### Architectural & Parameter Summary (~1.69B Class)
+
+| Dimension / Specification | Value | Note |
+| :--- | :--- | :--- |
+| **Embedding Dim ($D_E$)** | **$1,536$** | Halved from 3072 |
+| **KQV Dim ($D_{KQV}$)** | **$2,304$** | $18 \text{ heads} \times 128 \text{ head dim}$ |
+| **Focus Heads per Layer ($N_H$)** | **$18$** | Reduced from 36/32 |
+| **Head Dimension ($d_h$)** | **$128$** | Standard power-of-2 head dim |
+| **SwiGLU Intermediate Dim ($D_{FFN}$)** | **$6,144$** | $4 \times D_E$ |
+| **Retention Latent Dim ($d_L$)** | **$256$** | 9x compression over $D_{KQV}$ |
+| **Focus Layers ($N_F$)** | **$27$ layers** | 3 per block $\times$ 9 blocks |
+| **Retention Layers ($N_R$)** | **$9$ layers** | 1 per block $\times$ 9 blocks |
+| **Total Blocks ($N_B$) / Layers ($N_L$)** | **$9$ blocks / $36$ layers** | Exact original 3:1 topology |
+| **Context Window ($C_W$)** | **$65,536$ (64K)** | Reduced from 262k |
+| **Vocabulary Size ($VocabSize$)** | **$128,256$** | SmolLM3 Tokenizer |
+| **LoRA De-Embedding Rank ($r$)** | **$128$** | Halved from 256 |
+
+
+### Parameter Count Breakdown
+
+1. **Shared Input Embedding ($W_{emb}$)**: $128,256 \times 1,536 \approx \mathbf{0.197\text{ B}}$
+2. **27 Focus Layers**:
+   - Projections: $4 \times (1536 \times 2304) \approx 14.16\text{M}$
+   - SwiGLU MLP: $3 \times (1536 \times 6144) \approx 28.31\text{M}$
+   - Per Layer: $\approx 42.47\text{M} \implies 27 \times 42.47\text{M} \approx \mathbf{1.147\text{ B}}$
+3. **9 Retention Layers**:
+   - Projections ($W_Q, W_{KV}^L, W_K^L, W_V^L, W_O$): $\approx 8.65\text{M}$
+   - SwiGLU MLP: $\approx 28.31\text{M}$
+   - Per Layer: $\approx 36.96\text{M} \implies 9 \times 36.96\text{M} \approx \mathbf{0.333\text{ B}}$
+4. **LoRA De-Embedding Head ($r=128$)**: $(1536 \times 128) + (128 \times 128256) \approx \mathbf{0.017\text{ B}}$
+5. **Total Model Parameters**: $\mathbf{\approx 1.694\text{ Billion Parameters}}$ (~1.7B Model)

@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 from mock_d1.block import MockD1Block
 from mock_d1.model_mock import MockD1ForCausalLM
-from mock_d1.configure_mockd1 import MockD1Config
+from mock_d1.configure_mockd17B import MockD1Config
 from .checkpoint import CheckpointManager
 
 

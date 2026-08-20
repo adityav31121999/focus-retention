@@ -1,6 +1,6 @@
 from typing import List, Optional
 import torch
-from mock_d1.configure_mockd1 import MockD1Config
+from mock_d1.configure_mockd17B import MockD1Config
 
 class MockD1StateCache:
     """Fixed-dimension recursive state caching for O(1) memory step inference"""

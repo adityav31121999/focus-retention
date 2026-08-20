@@ -1,4 +1,4 @@
-from .configure_mockd1 import MockD1Config
+from .configure_mockd17B import MockD1Config
 from .model_mock import MockD1ForCausalLM, MockD1Model
 from .focus import MockD1FocusAttention
 from .retention import MockD1RetentionMechanism

@@ -1,7 +1,8 @@
+# feedforward.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .configure_mockd1 import MockD1Config
+from .configure_mockd17B import MockD1Config
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):

@@ -1,3 +1,4 @@
+# backward.py
 """
 Analytical Mathematical Reference & Backward Pass Derivations
 Focus-Retention Architecture (Mock-D1:7B)

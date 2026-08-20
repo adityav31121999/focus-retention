@@ -1,42 +1,53 @@
+# ==============================================================================
+# Mock-D1 (1.7B Class) Architecture Configuration (curriculum_config.yaml)
+# ==============================================================================
+
 model:
-  vocab_size: 262144
-  max_seq_len: 262144
-  hidden_dim: 3072
-  kqv_dim: 4096
-  intermediate_dim: 12288
-  num_layers: 36
-  num_blocks: 9
-  focus_layers_per_block: 3
-  retention_layers_per_block: 1
-  focus_heads: 32
+  vocab_size: 128256                   # SmolLM3 Vocab
+  max_seq_len: 65536                   # 64k Context Window
+  hidden_dim: 1536                     # D_E
+  kqv_dim: 2304                        # D_KQV (18 * 128)
+  intermediate_dim: 6144               # D_FFN
+  
+  # Topology
+  num_blocks: 9                        # 9 Blocks
+  num_layers: 36                       # 36 Layers Total
+  focus_layers_per_block: 3            # 27 Focus Layers Total
+  retention_layers_per_block: 1        # 9 Retention Layers Total
+  
+  # Attention Heads & Retention
+  focus_heads: 18                      # 18 Focus Heads (d_h = 128)
   retention_heads: 1
-  retention_latent_dim: 512
+  retention_latent_dim: 256            # d_L
   phi_act: "silu"
+  
+  # Embeddings & Regularization
   tie_word_embeddings: true
   use_lora_deembed: true
-  lora_deembed_rank: 256
+  lora_deembed_rank: 128               # r = 128
+  chunk_size: 512
   rms_norm_eps: 1.0e-6
   initializer_range: 0.02
 
-# Progressive Curriculum Schedule
+# Progressive Curriculum Schedule (128 -> 65.5k)
 curriculum:
   stages:
     - name: "Stage 1 (128)"
       seq_len: 128
-      batch_size: 32
-      gradient_accumulation_steps: 4
-      lr: 3.0e-4
+      batch_size: 16
+      gradient_accumulation_steps: 2
+      lr: 4.0e-4
       max_steps: 10000
 
-    - name: "Stage 2 (256)"
-      seq_len: 256
-      batch_size: 16
+    - name: "Stage 2 (512)"
+      seq_len: 512
+      batch_size: 8
       gradient_accumulation_steps: 4
-      lr: 3.0e-4
+      lr: 3.5e-4
       max_steps: 25000
 
-    - name: "Stage 3 (1024)"
-      seq_len: 1024
+    - name: "Stage 3 (2048)"
+      seq_len: 2048
       batch_size: 4
       gradient_accumulation_steps: 4
       lr: 2.5e-4
@@ -44,15 +55,15 @@ curriculum:
 
     - name: "Stage 4 (8192)"
       seq_len: 8192
-      batch_size: 1
+      batch_size: 2
       gradient_accumulation_steps: 8
       lr: 1.5e-4
       max_steps: 75000
 
-    - name: "Stage 5 (Full Context: 262k)"
-      seq_len: 262144
+    - name: "Stage 5 (Full Context: 65.5k)"
+      seq_len: 65536
       batch_size: 1
-      gradient_accumulation_steps: 1
+      gradient_accumulation_steps: 2
       lr: 8.0e-5
       max_steps: 100000
 
@@ -63,9 +74,8 @@ training:
   max_grad_norm: 1.0
   warmup_steps: 1000
   save_every: 2500
-  output_dir: "./checkpoints/curriculum_7b"
+  output_dir: "./checkpoints/mock_d1_1_7b"
 
 data:
   dataset_name: "HuggingFaceFW/fineweb"
-  tokenizer_name: "google/gemma-7b"
-  buffer_size: 20000
+  tokenizer_name: "HuggingFaceTB/SmolLM3-3B"

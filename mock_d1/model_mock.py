@@ -1,10 +1,11 @@
+# model_mock.py
 from typing import Optional, Tuple, List, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
-from .configure_mockd1 import MockD1Config
+from .configure_mockd17B import MockD1Config
 from .feedforward import RMSNorm
 from .block import MockD1Block
 
@@ -69,10 +70,10 @@ class MockD1Model(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        past_states: Optional[List[List[Optional[torch.Tensor]]]] = None
+        past_states: Optional[List[List[Optional[torch.Tensor]]]] = None,
+        seq_offset: int = 0
     ) -> Tuple[torch.Tensor, Optional[List[List[Optional[torch.Tensor]]]]]:
         
-        # Initial token embeddings X0 (injected into each Retention layer)
         x0 = self.embed_tokens(input_ids)
         h = x0
         new_states = [] if past_states is not None else None
@@ -80,11 +81,10 @@ class MockD1Model(nn.Module):
         for i, block in enumerate(self.blocks):
             block_states = past_states[i] if past_states is not None else None
 
-            # Activation Checkpointing for training long sequences
             if self.gradient_checkpointing and self.training and block_states is None:
                 def create_custom_forward(module):
                     def custom_forward(hidden_states, token_x0):
-                        out, _ = module(hidden_states, token_x0, states=None)
+                        out, _ = module(hidden_states, token_x0, states=None, seq_offset=seq_offset)
                         return out
                     return custom_forward
 
@@ -95,7 +95,7 @@ class MockD1Model(nn.Module):
                     use_reentrant=False
                 )
             else:
-                h, next_block_states = block(h, x0=x0, states=block_states)
+                h, next_block_states = block(h, x0=x0, states=block_states, seq_offset=seq_offset)
                 if new_states is not None:
                     new_states.append(next_block_states)
 
@@ -133,10 +133,11 @@ class MockD1ForCausalLM(nn.Module):
         self,
         input_ids: torch.LongTensor,
         labels: Optional[torch.LongTensor] = None,
-        past_states: Optional[List[List[Optional[torch.Tensor]]]] = None
+        past_states: Optional[List[List[Optional[torch.Tensor]]]] = None,
+        seq_offset: int = 0
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[List[Optional[torch.Tensor]]]]]:
         
-        hidden_states, next_states = self.model(input_ids, past_states=past_states)
+        hidden_states, next_states = self.model(input_ids, past_states=past_states, seq_offset=seq_offset)
         logits = self.lm_head(hidden_states)
 
         loss = None
@@ -149,3 +150,58 @@ class MockD1ForCausalLM(nn.Module):
             )
 
         return logits, loss, next_states
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int = 64,
+        temperature: float = 1.0,
+        top_k: int = 50
+    ) -> torch.Tensor:
+        """
+        Fast token-by-token autoregressive generation using recurrent state carry.
+        """
+        self.eval()
+        B, seq_len = input_ids.shape
+        device = input_ids.device
+
+        # 1. Initialize empty recurrent states across all blocks
+        past_states = []
+        for _ in range(self.config.num_blocks):
+            block_states = [
+                torch.zeros(B, self.config.focus_heads, self.config.focus_head_dim, self.config.focus_head_dim, device=device), # F1
+                torch.zeros(B, self.config.focus_heads, self.config.focus_head_dim, self.config.focus_head_dim, device=device), # F2
+                torch.zeros(B, self.config.focus_heads, self.config.focus_head_dim, self.config.focus_head_dim, device=device), # F3
+                {"l_kv_cache": None, "running_S": None}                                                                         # Retention
+            ]
+            past_states.append(block_states)
+
+        # 2. Prompt Prefill Phase (build initial states step-by-step)
+        for t in range(seq_len):
+            token = input_ids[:, t : t + 1]
+            logits, _, past_states = self.forward(token, past_states=past_states, seq_offset=t)
+
+        generated = input_ids
+
+        # 3. Decoding Loop (O(1) memory per step)
+        for step in range(max_new_tokens):
+            curr_pos = seq_len + step
+            last_logits = logits[:, -1, :]
+
+            if temperature > 0:
+                last_logits = last_logits / temperature
+                if top_k > 0:
+                    v, _ = torch.topk(last_logits, min(top_k, last_logits.size(-1)))
+                    last_logits[last_logits < v[:, [-1]]] = -float("inf")
+                probs = F.softmax(last_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(last_logits, dim=-1, keepdim=True)
+
+            generated = torch.cat([generated, next_token], dim=1)
+
+            # Single token forward step
+            logits, _, past_states = self.forward(next_token, past_states=past_states, seq_offset=curr_pos)
+
+        return generated

@@ -1,7 +1,8 @@
+# block.py
 from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
-from .configure_mockd1 import MockD1Config
+from .configure_mockd17B import MockD1Config
 from .feedforward import RMSNorm, MockD1MLP
 from .focus import MockD1FocusAttention
 from .retention import MockD1RetentionMechanism
@@ -29,13 +30,14 @@ class MockD1Block(nn.Module):
         self,
         x: torch.Tensor,
         x0: torch.Tensor,
-        states: Optional[List[Optional[torch.Tensor]]] = None
+        states: Optional[List[Optional[torch.Tensor]]] = None,
+        seq_offset: int = 0
     ) -> Tuple[torch.Tensor, Optional[List[Optional[torch.Tensor]]]]:
         new_states = [] if states is not None else None
 
         # F1
         s0 = states[0] if states is not None else None
-        f1_out, next_s0 = self.focus_layers[0](self.focus_norms[0](x), state=s0)
+        f1_out, next_s0 = self.focus_layers[0](self.focus_norms[0](x), state=s0, seq_offset=seq_offset)
         h = x + f1_out
         h = h + self.focus_mlps[0](self.focus_mlp_norms[0](h))
         if new_states is not None:
@@ -43,7 +45,7 @@ class MockD1Block(nn.Module):
 
         # F2
         s1 = states[1] if states is not None else None
-        f2_out, next_s1 = self.focus_layers[1](self.focus_norms[1](h), state=s1)
+        f2_out, next_s1 = self.focus_layers[1](self.focus_norms[1](h), state=s1, seq_offset=seq_offset)
         h = h + f2_out
         h = h + self.focus_mlps[1](self.focus_mlp_norms[1](h))
         if new_states is not None:
@@ -54,7 +56,7 @@ class MockD1Block(nn.Module):
 
         # F3
         s2 = states[2] if states is not None else None
-        f3_out, next_s2 = self.focus_layers[2](self.focus_norms[2](h), state=s2)
+        f3_out, next_s2 = self.focus_layers[2](self.focus_norms[2](h), state=s2, seq_offset=seq_offset)
         f3_out = f3_out + self.focus_mlps[2](self.focus_mlp_norms[2](f3_out))
         if new_states is not None:
             new_states.append(next_s2)

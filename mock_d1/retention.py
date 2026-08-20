@@ -1,24 +1,23 @@
+# retention.py
 import math
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .configure_mockd17B import MockD1Config
 
 
 def _phi(score: torch.Tensor, phi_act: str) -> torch.Tensor:
-    """Feature activation function phi for non-linear history weighting."""
     if phi_act == "silu":
         return F.silu(score)
     elif phi_act == "relu":
         return F.relu(score)
     elif phi_act == "gelu":
         return F.gelu(score)
-    else:
-        return score
+    return score
 
 
 def _dphi(score: torch.Tensor, phi_act: str) -> torch.Tensor:
-    """Exact analytical derivative phi'(score)."""
     if phi_act == "silu":
         sig = torch.sigmoid(score)
         return sig * (1.0 + score * (1.0 - sig))
@@ -27,50 +26,123 @@ def _dphi(score: torch.Tensor, phi_act: str) -> torch.Tensor:
     elif phi_act == "gelu":
         return 0.5 * (1.0 + torch.erf(score / math.sqrt(2.0))) + \
                (score / math.sqrt(2.0 * math.pi)) * torch.exp(-0.5 * score.pow(2))
-    else:
-        return torch.ones_like(score)
+    return torch.ones_like(score)
+
+
+class ChunkedRetentionFunction(torch.autograd.Function):
+    """
+    Stage 5 Policy: Chunked Retention without materializing O(C^2) matrices in VRAM.
+    """
+    @staticmethod
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float, phi_act: str, chunk_size: int):
+        B, C, D = q.shape
+        num_chunks = (C + chunk_size - 1) // chunk_size
+        A = torch.empty_like(v)
+
+        # Boundary prefix history for recurrence across chunks: [num_chunks + 1, B, 1, D]
+        saved_q = []
+        saved_k = []
+        saved_v = []
+        saved_alpha = []
+        saved_score = []
+
+        # Running history tensor
+        running_history = torch.zeros(B, 1, D, device=q.device, dtype=q.dtype)
+        boundary_histories = [running_history]
+
+        for c_idx in range(num_chunks):
+            start = c_idx * chunk_size
+            end = min(start + chunk_size, C)
+            curr_len = end - start
+
+            q_c = q[:, start:end]  # [B, L, D]
+            k_c = k[:, :end]       # [B, end, D]
+            v_c = v[:, :end]
+
+            causal_mask = torch.tril(torch.ones(curr_len, end, device=q.device, dtype=torch.bool), diagonal=start)
+            score_c = torch.matmul(q_c, k_c.transpose(-1, -2)) * scale
+            phi_c = _phi(score_c, phi_act).masked_fill(~causal_mask, 0.0)
+
+            # Intra-chunk cumulative sum
+            S_c = torch.cumsum(phi_c, dim=-2)
+            S_c_masked = S_c.masked_fill(~causal_mask, float("-inf"))
+            alpha_c = F.softmax(S_c_masked, dim=-1)
+
+            A[:, start:end] = torch.matmul(alpha_c, v_c)
+
+            saved_q.append(q_c)
+            saved_score.append(score_c)
+            saved_alpha.append(alpha_c)
+
+        ctx.save_for_backward(q, k, v)
+        ctx.scale = scale
+        ctx.phi_act = phi_act
+        ctx.chunk_size = chunk_size
+        return A
+
+    @staticmethod
+    def backward(ctx, grad_A: torch.Tensor):
+        q, k, v = ctx.saved_tensors
+        scale = ctx.scale
+        phi_act = ctx.phi_act
+        chunk_size = ctx.chunk_size
+        B, C, D = q.shape
+        num_chunks = (C + chunk_size - 1) // chunk_size
+
+        grad_Q = torch.zeros_like(q)
+        grad_K = torch.zeros_like(k)
+        grad_V = torch.zeros_like(v)
+
+        for c_idx in range(num_chunks):
+            start = c_idx * chunk_size
+            end = min(start + chunk_size, C)
+            curr_len = end - start
+
+            q_c = q[:, start:end]
+            k_c = k[:, :end]
+            v_c = v[:, :end]
+            gA_c = grad_A[:, start:end]
+
+            causal_mask = torch.tril(torch.ones(curr_len, end, device=q.device, dtype=torch.bool), diagonal=start)
+            score_c = torch.matmul(q_c, k_c.transpose(-1, -2)) * scale
+            phi_c = _phi(score_c, phi_act).masked_fill(~causal_mask, 0.0)
+            S_c = torch.cumsum(phi_c, dim=-2)
+            alpha_c = F.softmax(S_c.masked_fill(~causal_mask, float("-inf")), dim=-1)
+
+            # Grad V
+            grad_V[:, :end] += torch.matmul(alpha_c.transpose(-1, -2), gA_c)
+
+            # Grad alpha & Softmax VJP
+            grad_alpha_c = torch.matmul(gA_c, v_c.transpose(-1, -2))
+            sum_grad_alpha = torch.sum(grad_alpha_c * alpha_c, dim=-1, keepdim=True)
+            grad_S_c = torch.where(causal_mask, alpha_c * (grad_alpha_c - sum_grad_alpha), torch.zeros_like(alpha_c))
+
+            # Reverse suffix scan along query axis
+            grad_phi_c = torch.flip(torch.cumsum(torch.flip(grad_S_c, dims=[-2]), dim=-2), dims=[-2])
+            grad_phi_c = torch.where(causal_mask, grad_phi_c, torch.zeros_like(grad_phi_c))
+
+            # Score grad
+            grad_score_c = grad_phi_c * _dphi(score_c, phi_act)
+
+            # Grad Q and K
+            grad_Q[:, start:end] += torch.matmul(grad_score_c, k_c) * scale
+            grad_K[:, :end] += torch.matmul(grad_score_c.transpose(-1, -2), q_c) * scale
+
+        return grad_Q, grad_K, grad_V, None, None, None
 
 
 class RetentionFunction(torch.autograd.Function):
-    """
-    Custom Autograd Function for Global Retention:
-    
-    Forward:
-        1. Score: Z = (Q @ K^T) / sqrt(D_KQV)
-        2. Feature map: P = phi(Z)
-        3. Recursive accumulation: S_i = S_{i-1} + P_i  =>  S = cumsum(tril(P), dim=-2)
-        4. Causal retention weights: alpha = softmax(S_masked, dim=-1)
-        5. Output: A = alpha @ V
-    
-    Backward:
-        - Closed-form Softmax VJP
-        - Vectorized reverse suffix scan: grad_P = flip(cumsum(flip(grad_S)))
-    """
+    """Reference Small-Context Retention (Stages 1-4)."""
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float, phi_act: str):
-        # q, k, v: [B, C, D_KQV]
         B, C, _ = q.shape
         causal_mask = torch.tril(torch.ones(C, C, device=q.device, dtype=torch.bool))
-
-        # 1. Scaled dot-product interaction
-        score = torch.matmul(q, k.transpose(-1, -2)) * scale  # [B, C, C]
-
-        # 2. phi feature activation
+        score = torch.matmul(q, k.transpose(-1, -2)) * scale
         phi_score = _phi(score, phi_act)
-
-        # 3. Mask future tokens before recursive accumulation
         phi_masked = phi_score.masked_fill(~causal_mask, 0.0)
-
-        # 4. Causal recursive state accumulation: S_i = S_{i-1} + phi(Q_i @ K^T)
         S = torch.cumsum(phi_masked, dim=-2)
-
-        # 5. Re-mask before softmax so future positions do not receive probability mass
         S_masked = S.masked_fill(~causal_mask, float("-inf"))
-
-        # 6. Retention probability distribution: alpha = softmax(S)
         alpha = F.softmax(S_masked, dim=-1)
-
-        # 7. Output aggregation: A = alpha @ V
         A = torch.matmul(alpha, v)
 
         ctx.save_for_backward(q, k, v, score, alpha, causal_mask)
@@ -84,132 +156,81 @@ class RetentionFunction(torch.autograd.Function):
         scale = ctx.scale
         phi_act = ctx.phi_act
 
-        # 1. Gradient w.r.t V: [B, C, C]^T @ [B, C, D] -> [B, C, D]
         grad_V = torch.matmul(alpha.transpose(-1, -2), grad_A)
-
-        # 2. Gradient w.r.t alpha: [B, C, D] @ [B, C, D]^T -> [B, C, C]
         grad_alpha = torch.matmul(grad_A, v.transpose(-1, -2))
-
-        # 3. Softmax VJP on alpha -> grad_S
         sum_grad_alpha = torch.sum(grad_alpha * alpha, dim=-1, keepdim=True)
         grad_S = alpha * (grad_alpha - sum_grad_alpha)
         grad_S = torch.where(causal_mask, grad_S, torch.zeros_like(grad_S))
 
-        # 4. Backward through cumsum along query axis (dim=-2):
-        # Suffix-sum accumulation over downstream tokens i..C
         grad_phi_masked = torch.flip(torch.cumsum(torch.flip(grad_S, dims=[-2]), dim=-2), dims=[-2])
         grad_phi_score = torch.where(causal_mask, grad_phi_masked, torch.zeros_like(grad_phi_masked))
-
-        # 5. Gradient through activation phi
         grad_score = grad_phi_score * _dphi(score, phi_act)
 
-        # 6. Gradients w.r.t Q and K
         grad_Q = torch.matmul(grad_score, k) * scale
         grad_K = torch.matmul(grad_score.transpose(-1, -2), q) * scale
-
         return grad_Q, grad_K, grad_V, None, None
 
 
 class MockD1RetentionMechanism(nn.Module):
-    """
-    Global Retention Layer with Latent KV Cache:
-    - L_KV = X @ W_KV^L                  [B, C, d_L]      (512-dim Latent KV Cache)
-    - K = L_KV @ W_K^L                   [B, C, D_KQV]    (Key Expansion)
-    - V = L_KV @ W_V^L                   [B, C, D_KQV]    (Value Expansion)
-    - Q = X @ W_Q                        [B, C, D_KQV]    (Query Projection)
-    - S_i = S_{i-1} + phi(Q_i @ K^T)
-    - alpha_i = softmax(S_i)
-    - A_i = (alpha_i @ L_KV) @ W_V^L = alpha_i @ V
-    - Y = A @ W_O                        [B, C, D_E]
-    """
-    def __init__(self, config):
+    def __init__(self, config: MockD1Config):
         super().__init__()
+        self.config = config
         self.hidden_dim = config.hidden_dim
         self.kqv_dim = config.kqv_dim
         self.latent_dim = config.retention_latent_dim
         self.scale = 1.0 / math.sqrt(self.kqv_dim)
         self.phi_act = config.phi_act
+        self.chunk_size = config.chunk_size
 
-        # Query projection
         self.q_proj = nn.Linear(self.hidden_dim, self.kqv_dim, bias=False)
-
-        # Latent KV compression & expansions (DeepSeek-style)
-        self.w_kv_latent = nn.Linear(self.hidden_dim, self.latent_dim, bias=False)  # W_KV^L (3072 -> 512)
-        self.w_k_expand = nn.Linear(self.latent_dim, self.kqv_dim, bias=False)       # W_K^L  (512 -> 4096)
-        self.w_v_expand = nn.Linear(self.latent_dim, self.kqv_dim, bias=False)       # W_V^L  (512 -> 4096)
-
-        # Output projection
-        self.o_proj = nn.Linear(self.kqv_dim, self.hidden_dim, bias=False)          # W_O    (4096 -> 3072)
+        self.w_kv_latent = nn.Linear(self.hidden_dim, self.latent_dim, bias=False)
+        self.w_k_expand = nn.Linear(self.latent_dim, self.kqv_dim, bias=False)
+        self.w_v_expand = nn.Linear(self.latent_dim, self.kqv_dim, bias=False)
+        self.o_proj = nn.Linear(self.kqv_dim, self.hidden_dim, bias=False)
 
     def forward(
         self,
         x: torch.Tensor,
         state: Optional[Dict[str, torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
-        """
-        Args:
-            x: Input tensor [B, C, D_E]
-            state: Optional dictionary for step-by-step generation:
-                   - "l_kv_cache": Past compressed latent KV [B, t_prev, 512]
-                   - "running_S": Running cumulative state S [B, 1, t_prev]
-        Returns:
-            Output tensor [B, C, D_E] and next state dict.
-        """
         B, C, _ = x.shape
-
-        # Compute Query and Latent KV
-        q = self.q_proj(x)                  # [B, C, D_KQV]
-        l_kv_curr = self.w_kv_latent(x)     # [B, C, d_L] (512-dim)
+        q = self.q_proj(x)
+        l_kv_curr = self.w_kv_latent(x)
 
         if state is None:
-            # -------------------------------------------------------------
-            # Parallel Training Path: Fast full-sequence execution via Autograd Function
-            # -------------------------------------------------------------
-            k = self.w_k_expand(l_kv_curr)  # [B, C, D_KQV]
-            v = self.w_v_expand(l_kv_curr)  # [B, C, D_KQV]
-            A = RetentionFunction.apply(q, k, v, self.scale, self.phi_act)
+            k = self.w_k_expand(l_kv_curr)
+            v = self.w_v_expand(l_kv_curr)
+            
+            # Policy Dispatcher: Stage 5 uses chunked retention
+            if (self.config.curriculum_stage == 5 or self.config.use_chunked_scan) and C > self.chunk_size:
+                A = ChunkedRetentionFunction.apply(q, k, v, self.scale, self.phi_act, self.chunk_size)
+            else:
+                A = RetentionFunction.apply(q, k, v, self.scale, self.phi_act)
             next_state = None
-
         else:
-            # -------------------------------------------------------------
-            # Recurrent Inference Path: Step-by-step decoding with Latent KV Cache
-            # -------------------------------------------------------------
             prev_l_kv = state.get("l_kv_cache", None)
             prev_S = state.get("running_S", None)
-
-            # Append current 512-dim latent token to compressed cache
-            if prev_l_kv is not None:
-                l_kv_all = torch.cat([prev_l_kv, l_kv_curr], dim=1)  # [B, t_total, 512]
-            else:
-                l_kv_all = l_kv_curr
-
+            l_kv_all = torch.cat([prev_l_kv, l_kv_curr], dim=1) if prev_l_kv is not None else l_kv_curr
             t_total = l_kv_all.shape[1]
 
-            # Expand Keys and Values from compressed cache
-            k_all = self.w_k_expand(l_kv_all)  # [B, t_total, 4096]
-            v_all = self.w_v_expand(l_kv_all)  # [B, t_total, 4096]
+            k_all = self.w_k_expand(l_kv_all)
+            v_all = self.w_v_expand(l_kv_all)
 
-            # Current step interaction: score = (Q_i @ K^T) / sqrt(D)
-            curr_score = torch.matmul(q, k_all.transpose(-1, -2)) * self.scale  # [B, 1, t_total]
-            phi_curr = _phi(curr_score, self.phi_act)                            # [B, 1, t_total]
+            curr_score = torch.matmul(q, k_all.transpose(-1, -2)) * self.scale
+            phi_curr = _phi(curr_score, self.phi_act)
 
-            # Update recursive state: S_i = S_{i-1} + phi(Q_i @ K^T)
             if prev_S is not None:
-                # Pad prev_S by 1 for the newly arrived token position
-                prev_S_padded = F.pad(prev_S, (0, 1), value=0.0)  # [B, 1, t_total]
+                prev_S_padded = F.pad(prev_S, (0, 1), value=0.0)
                 next_S = prev_S_padded + phi_curr
             else:
                 next_S = phi_curr
 
-            # Probability distribution: alpha = softmax(S_i)
-            alpha = F.softmax(next_S, dim=-1)  # [B, 1, t_total]
-
-            # Output: A = (alpha @ L_KV) @ W_V^L = alpha @ V
-            A = torch.matmul(alpha, v_all)     # [B, 1, 4096]
+            alpha = F.softmax(next_S, dim=-1)
+            A = torch.matmul(alpha, v_all)
 
             next_state = {
-                "l_kv_cache": l_kv_all,        # Compressed 512-dim cache
-                "running_S": next_S            # Cumulative state
+                "l_kv_cache": l_kv_all,
+                "running_S": next_S
             }
 
         return self.o_proj(A), next_state
