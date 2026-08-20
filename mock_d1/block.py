@@ -4,7 +4,7 @@ import torch.nn as nn
 from .configure_mockd1 import MockD1Config
 from .feedforward import RMSNorm, MockD1MLP
 from .focus import MockD1FocusAttention
-from .retention import MockD1RetentionAttention
+from .retention import MockD1RetentionMechanism
 
 class MockD1Block(nn.Module):
     """
@@ -21,7 +21,7 @@ class MockD1Block(nn.Module):
         self.focus_mlps = nn.ModuleList([MockD1MLP(config) for _ in range(3)])
 
         self.ret_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
-        self.ret_layer = MockD1RetentionAttention(config)
+        self.ret_layer = MockD1RetentionMechanism(config)
         self.ret_mlp_norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
         self.ret_mlp = MockD1MLP(config)
 

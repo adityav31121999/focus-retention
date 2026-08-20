@@ -40,7 +40,7 @@ class FocusRoPE(nn.Module):
         return (x * cos) + (self._rotate_half(x) * sin)
 
 
-class DecayedFocusAttentionFunction(torch.autograd.Function):
+class FocusAttentionFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gamma: torch.Tensor, scale: float):
         # q, k, v: [B, H, C, d_h], gamma: [1, H, 1, 1]
@@ -147,7 +147,7 @@ class MockD1FocusAttention(nn.Module):
 
         if state is None:
             # Parallel Training Mode via Decayed Autograd Function
-            A = DecayedFocusAttentionFunction.apply(q, k, v, gamma, self.scale)
+            A = FocusAttentionFunction.apply(q, k, v, gamma, self.scale)
             next_state = None
         else:
             # Recurrent Autoregressive Inference: M_t = gamma * M_{t-1} + (q_t^T @ k_t) / sqrt(d)

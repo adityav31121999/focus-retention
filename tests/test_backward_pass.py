@@ -1,6 +1,6 @@
 import pytest
 import torch
-from mock_d1.focus import DecayedFocusAttentionFunction
+from mock_d1.focus import FocusAttentionFunction
 from mock_d1.retention import RetentionFunction
 
 def test_focus_attention_gradcheck():
@@ -15,7 +15,7 @@ def test_focus_attention_gradcheck():
     gamma = torch.rand(1, H, 1, 1, dtype=torch.float64, requires_grad=True)
 
     # PyTorch gradcheck tests analytical vs numerical gradients
-    passed = torch.autograd.gradcheck(DecayedFocusAttentionFunction.apply, (q, k, v, gamma, scale), eps=1e-6, atol=1e-4)
+    passed = torch.autograd.gradcheck(FocusAttentionFunction.apply, (q, k, v, gamma, scale), eps=1e-6, atol=1e-4)
     assert passed, "Focus Attention analytical gradients failed gradcheck!"
     print("[PASS] Focus Attention Gradcheck Passed!")
 

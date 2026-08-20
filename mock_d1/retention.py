@@ -110,7 +110,7 @@ class RetentionFunction(torch.autograd.Function):
         return grad_Q, grad_K, grad_V, None, None
 
 
-class MockD1RetentionAttention(nn.Module):
+class MockD1RetentionMechanism(nn.Module):
     """
     Global Retention Layer with Latent KV Cache:
     - L_KV = X @ W_KV^L                  [B, C, d_L]      (512-dim Latent KV Cache)

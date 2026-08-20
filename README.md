@@ -32,7 +32,11 @@ Following is the breakdown:
 
 This is similar to linear attention, but instead of $QK^TV$, we take $VQ^TK$. If we look closely, this almost looks similar, instead of doing feature extractions, we apply softmax. The content is also in `K` and `Q`, if we have to go by standard definition, this will blur the past, but if we consider this as new mechanism, and ignore the standard vanilla transformer, this attention is doing same thing as linear attention but more on vanilla standard manner.
 
-> Added Decay Factor ($\gamma$) for $M_{i-1}$ so that we do not accumulate all past and corrup the future predictions.
+> Added Decay Factor ($\gamma$) for $M_{i-1}$ so that we do not accumulate all past and corrupt the future predictions. If we let the accumulation for longer context, we meight end up with values too large or too small.
+
+This changes the formula:
+$$M_i = \gamma \cdot M_{i-1} + \frac{Q_i^T \times K_i}{\sqrt{d}}$$
+$$\gamma \in (0.1, 0.9)$$
 
 ---
 
@@ -58,7 +62,9 @@ For memory footprint reduction, we will use concept similar to Deepseek MHLA.
 - $\alpha = softmax(S)$
 - $A = \alpha \times V = (\alpha_i \times L_{KV}) \times W_V^L$
 
-> We only take latent representatin of Keys and Values, not Queries.
+> We only take latent representatin of Keys and Values, not Queries. This latent representation reduces the memory requirement of KV-cache.
+
+---
 
 ## Backpropagation
 
@@ -143,6 +149,53 @@ $$\nabla_{P_i} \mathcal{L} = \sum_{k=i}^{C} \nabla_{S_k} \mathcal{L}$$
    $$\nabla_Q \mathcal{L} = \frac{1}{\sqrt{D_{KQV}}} G_{\text{score}} K, \quad \nabla_K \mathcal{L} = \frac{1}{\sqrt{D_{KQV}}} G_{\text{score}}^T Q, \quad \nabla_V \mathcal{L} = \alpha^T (\nabla_A \mathcal{L})$$
    $$\nabla_{L_{KV}} \mathcal{L} = \nabla_K \mathcal{L} (W_K^L)^T + \nabla_V \mathcal{L} (W_V^L)^T$$
    $$\nabla_{W_{KV}^L} = X^T (\nabla_{L_{KV}} \mathcal{L}), \quad \nabla_{W_K^L} = L_{KV}^T (\nabla_K \mathcal{L}), \quad \nabla_{W_V^L} = L_{KV}^T (\nabla_V \mathcal{L})$$
+
+---
+
+## Parallel Execution
+
+The recursive formulation of `M_i` (Focus) and `S_i` (Retention) looks inherently sequential, but it splits cleanly into a **parallel phase** and a **much shorter sequential phase**. This section describes that split and how it bounds the memory needed to hold state for backpropagation over very long contexts.
+
+### 1. Two-Phase Execution
+
+**Phase A — Per-token contribution (fully parallel).**
+For every token `i` in the context (n tokens total), the token's own raw contribution does not depend on any other token, so it can be computed for the whole sequence in one batched op:
+
+- Focus: $P_i = Q_i^{T} \times K_i \in \mathbb{R}^{d_h \times d_h}$
+- Retention: $P_i = \phi(Q_i \times K^{T})$
+
+**Phase B — Recursive accumulation (token-wise, decayed).**
+Only the *carry* between tokens is sequential:
+
+$$M_i = \gamma \cdot M_{i-1} + Q_i^{T} \times K_i, \qquad M_0 = \mathbf{0}^{d \times d}, \qquad 0.1 < \gamma < 0.9$$
+
+with $\gamma$ a learnable per-head decay applied throughout every layer so that history doesn't accumulate unboundedly and corrupt future predictions. The retention path uses the same two-phase structure, just without the decay term on the pre-softmax score:
+
+$$S_i = S_{i-1} + \phi(Q_i \times K^{T})$$
+
+Because this recurrence is linear in the previous state, it does **not** need to run as a literal Python `for t in range(C)` loop (as `FocusAttentionFunction` and `RetentionFunction` currently do). It should instead run as a **chunked/blockwise scan**:
+
+1. Split the sequence into blocks of size `B`.
+2. Compute all `P_i` for every token in every block in parallel (Phase A, batched matmul).
+3. Compute the intra-block cumulative sums in parallel.
+4. Propagate only the block-boundary carry (`M`/`S` at the end of each block) sequentially across `C / B` blocks, instead of across all `C` tokens.
+
+This turns an `O(C)` sequential dependency into `O(C / B)` sequential steps, with all other work batched — the same trick used by chunked linear-attention/RetNet-style recurrences, and it removes the need to ever materialize the full `[B, H, C, d_h, d_h]` state tensor at once.
+
+### 2. Why the Naive Loop Doesn't Scale
+
+At `max_seq_len = 262,144`, a per-token Python loop over `M` (shape `[B, H, C, d_h, d_h]`) is both slow (no batched parallelism across the sequence axis) and memory-heavy, since the current `forward`/`backward` in `focus.py` explicitly allocate and store `M` for every timestep for use by the backward pass. The chunked scan above avoids storing every intermediate `M_t`/`S_t` by only checkpointing block boundaries and recomputing the intra-block values on demand during backward (the same idea as activation checkpointing, applied at the block level instead of the layer level).
+
+
+| | Original (per-token loop) | New (chunked parallel scan) |
+|---|---|---|
+| Sequential steps | `O(C)` | `O(C/B)` |
+| Peak state memory | `O(C · d_h²)` — scales with full context | `O(B · d_h²)` — bounded by block size |
+| GPU utilization | Poor (tiny per-step ops) | High (large batched matmuls) |
+| Correctness | Exact, easy to reason about | Must match reference numerically; more failure modes (chunk-boundary decay, FP8 error) |
+| Implementation effort | Trivial (already written) | Nontrivial custom kernel + checkpointing logic |
+| Feasible at `C = 262,144`? | **No** | Yes (by design) |
+| Best use | Curriculum Stages 1–4, correctness testing, small-context debugging | Curriculum Stage 5, real training/inference at target context |
 
 
 ---
@@ -229,6 +282,7 @@ Token injection maintains the continuity of original information, while residual
 - **LoRA De-Embedding Head ($r=256$)**: ~0.068 Billion Parameters
 - **Total Model Parameters**: **~6.588 Billion Parameters** (~6.6B Class / **Mock-D1:7B**)
 
+---
 
 ## 25B and 100B
 

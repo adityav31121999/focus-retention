@@ -16,7 +16,7 @@ from mock_d1.configure_mockd1 import MockD1Config
 from mock_d1.model_mock import MockD1ForCausalLM, MockD1Model
 from mock_d1.block import MockD1Block
 from mock_d1.focus import MockD1FocusAttention
-from mock_d1.retention import MockD1RetentionAttention
+from mock_d1.retention import MockD1RetentionMechanism
 from mock_d1.feedforward import MockD1MLP, RMSNorm
 from inference.cache import MockD1StateCache
 
