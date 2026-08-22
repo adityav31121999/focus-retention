@@ -1,13 +1,14 @@
 # ==============================================================================
-# Mock-D1 (7B Class) Architecture Configuration (default_config.yaml)
+# Mock-D1 (7B Class) Architecture Configuration (7b_config.yaml)
+# Multi-GPU Distributed (DDP / FSDP) and Cloud GPU Pod Training
 # ==============================================================================
 
 model:
-  # General Dimensions
+  model_name: "Mock-D1-7B"
   vocab_size: 262144                   # Gemma Vocab (2^18)
   max_seq_len: 262144                  # Context window C_W (2^18)
   hidden_dim: 3072                     # D_E
-  kqv_dim: 4096                        # D_KQV
+  kqv_dim: 4096                        # D_KQV (32 heads * 128 head_dim)
   intermediate_dim: 12288              # D_FFN (SwiGLU)
   
   # Block & Layer Topology
@@ -16,11 +17,13 @@ model:
   focus_layers_per_block: 3            # N_F (27 Focus layers total)
   retention_layers_per_block: 1        # N_R (9 Retention layers total)
   
-  # Focus Attention Weights
-  focus_heads: 32                      # N_H
-  # d_h (Head Dim) = 4096 / 32 = 128
+  # Focus Attention
+  focus_heads: 32                      # N_H (d_h = 4096 / 32 = 128)
+  use_rope: true
+  rope_base: 500000.0
+  use_focus_decay: true
   
-  # Retention Weights
+  # Retention Mechanism
   retention_heads: 1
   retention_latent_dim: 512            # d_L (Latent KV-cache dimension)
   phi_act: "silu"
@@ -30,7 +33,9 @@ model:
   use_lora_deembed: true
   lora_deembed_rank: 256               # r = 256
   
-  # Normalization & Regularization
+  # Scan & Regularization
+  chunk_size: 512
+  use_chunked_scan: true
   rms_norm_eps: 1.0e-6
   initializer_range: 0.02
   dropout: 0.0
@@ -53,5 +58,5 @@ training:
 data:
   dataset_name: "HuggingFaceFW/fineweb"
   tokenizer_name: "google/gemma-7b"     # 262,144 Vocab Tokenizer
-  seq_len: 4096                        # Chunk length during standard pretraining
+  seq_len: 4096
   buffer_size: 20000

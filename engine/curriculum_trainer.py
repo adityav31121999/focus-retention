@@ -7,7 +7,7 @@ from data.curriculum_streamer import CurriculumStreamer, create_curriculum_datal
 
 class CurriculumTrainer:
     """
-    Manages progressive context growth: 128 -> 256 -> 1024 -> 8192 -> 262144.
+    Manages progressive context growth: 128 -> 512 -> 2048 -> 8192 -> 65536 / 262144.
     """
     def __init__(
         self,
@@ -18,18 +18,41 @@ class CurriculumTrainer:
         curriculum_stages: list,
         checkpoint_manager: CheckpointManager,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        mixed_precision: str = "auto",
         max_grad_norm: float = 1.0,
         save_every: int = 2500,
     ):
-        self.model = model.to(device)
+        self.device = torch.device(device)
+        self.model = model.to(self.device)
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.streamer = streamer
         self.stages = curriculum_stages
         self.ckpt_manager = checkpoint_manager
-        self.device = device
         self.max_grad_norm = max_grad_norm
         self.save_every = save_every
+
+        # Configure mixed precision
+        self.use_amp = False
+        self.amp_dtype = torch.float32
+        self.scaler = None
+
+        if self.device.type == "cuda":
+            if mixed_precision == "auto":
+                if torch.cuda.is_bf16_supported():
+                    self.use_amp = True
+                    self.amp_dtype = torch.bfloat16
+                else:
+                    self.use_amp = True
+                    self.amp_dtype = torch.float16
+                    self.scaler = torch.cuda.amp.GradScaler()
+            elif mixed_precision in ["bfloat16", "bf16"]:
+                self.use_amp = True
+                self.amp_dtype = torch.bfloat16
+            elif mixed_precision in ["float16", "fp16"]:
+                self.use_amp = True
+                self.amp_dtype = torch.float16
+                self.scaler = torch.cuda.amp.GradScaler()
 
     def _get_current_stage(self, step: int):
         for stage in self.stages:
@@ -77,15 +100,33 @@ class CurriculumTrainer:
                 input_ids = batch["input_ids"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                # Forward & Backward
-                _, loss, _ = self.model(input_ids=input_ids, labels=labels)
-                loss = loss / grad_accum
-                loss.backward()
+                # Forward & Backward with AMP
+                if self.use_amp:
+                    with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                        _, loss, _ = self.model(input_ids=input_ids, labels=labels)
+                        loss = loss / grad_accum
+                    
+                    if self.scaler is not None:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+                else:
+                    _, loss, _ = self.model(input_ids=input_ids, labels=labels)
+                    loss = loss / grad_accum
+                    loss.backward()
+
                 accum_loss += loss.item() * grad_accum
 
             # Gradient step
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            self.optimizer.step()
+            if self.scaler is not None:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+
             if self.scheduler:
                 self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)

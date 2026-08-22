@@ -1,0 +1,87 @@
+# ==============================================================================
+# Mock-D1 (7B Class) Progressive Curriculum Configuration (7b_curriculum.yaml)
+# ==============================================================================
+
+model:
+  model_name: "Mock-D1-7B"
+  vocab_size: 262144                   # Gemma Vocab (2^18)
+  max_seq_len: 262144                  # Context window C_W (2^18)
+  hidden_dim: 3072                     # D_E
+  kqv_dim: 4096                        # D_KQV
+  intermediate_dim: 12288              # D_FFN (SwiGLU)
+  
+  # Topology
+  num_layers: 36                       # N_L
+  num_blocks: 9                        # N_B = 9 Blocks
+  focus_layers_per_block: 3            # 27 Focus layers total
+  retention_layers_per_block: 1        # 9 Retention layers total
+  
+  # Attention Heads & Retention
+  focus_heads: 32                      # N_H = 32
+  use_rope: true
+  rope_base: 500000.0
+  use_focus_decay: true
+  retention_heads: 1
+  retention_latent_dim: 512            # d_L
+  phi_act: "silu"
+  
+  # Embeddings & Regularization
+  tie_word_embeddings: true
+  use_lora_deembed: true
+  lora_deembed_rank: 256
+  chunk_size: 512
+  use_chunked_scan: true
+  rms_norm_eps: 1.0e-6
+  initializer_range: 0.02
+  dropout: 0.0
+
+curriculum:
+  stages:
+    - name: "Stage 1 (128)"
+      seq_len: 128
+      batch_size: 8
+      gradient_accumulation_steps: 4
+      lr: 3.0e-4
+      max_steps: 15000
+
+    - name: "Stage 2 (512)"
+      seq_len: 512
+      batch_size: 4
+      gradient_accumulation_steps: 8
+      lr: 2.5e-4
+      max_steps: 35000
+
+    - name: "Stage 3 (2048)"
+      seq_len: 2048
+      batch_size: 2
+      gradient_accumulation_steps: 16
+      lr: 2.0e-4
+      max_steps: 65000
+
+    - name: "Stage 4 (8192)"
+      seq_len: 8192
+      batch_size: 1
+      gradient_accumulation_steps: 32
+      lr: 1.2e-4
+      max_steps: 85000
+
+    - name: "Stage 5 (Full Context: 262k)"
+      seq_len: 262144
+      batch_size: 1
+      gradient_accumulation_steps: 32
+      lr: 6.0e-5
+      max_steps: 100000
+
+training:
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  warmup_steps: 2000
+  save_every: 2500
+  output_dir: "./checkpoints/mock_d1_7b"
+
+data:
+  dataset_name: "HuggingFaceFW/fineweb"
+  tokenizer_name: "google/gemma-7b"
+  buffer_size: 20000

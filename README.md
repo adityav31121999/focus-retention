@@ -64,6 +64,12 @@ For memory footprint reduction, we will use concept similar to Deepseek MHLA.
 
 > We only take latent representatin of Keys and Values, not Queries. This latent representation reduces the memory requirement of KV-cache.
 
+## Un-Embedding
+
+De-embedding or un-embedding will be used to produce output of transformer, which will be softmaxed to get probability distribution.
+
+$$D = E + 
+
 ---
 
 ## Backpropagation

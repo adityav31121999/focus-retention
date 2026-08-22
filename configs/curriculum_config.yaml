@@ -1,22 +1,28 @@
 # ==============================================================================
-# Mock-D1 (1.7B Class) Architecture Configuration (curriculum_config.yaml)
+# Mock-D1 Progressive Curriculum Configuration (curriculum_config.yaml)
+# Defaults to Mock-D1:1.7B Mini Model (Stages 1 to 5)
+# For 7B Model, use configs/7b_curriculum.yaml or pass --model_size 7B
 # ==============================================================================
 
 model:
-  vocab_size: 128256                   # SmolLM3 Vocab
-  max_seq_len: 65536                   # 64k Context Window
+  model_name: "Mock-D1-1.7B"
+  vocab_size: 128256                   # SmolLM3 Tokenizer Vocab
+  max_seq_len: 65536                   # Context Window (64k)
   hidden_dim: 1536                     # D_E
-  kqv_dim: 2304                        # D_KQV (18 * 128)
-  intermediate_dim: 6144               # D_FFN
+  kqv_dim: 2304                        # D_KQV (18 heads * 128 head_dim)
+  intermediate_dim: 6144               # D_FFN (SwiGLU)
   
   # Topology
-  num_blocks: 9                        # 9 Blocks
   num_layers: 36                       # 36 Layers Total
+  num_blocks: 9                        # 9 Blocks
   focus_layers_per_block: 3            # 27 Focus Layers Total
   retention_layers_per_block: 1        # 9 Retention Layers Total
   
   # Attention Heads & Retention
   focus_heads: 18                      # 18 Focus Heads (d_h = 128)
+  use_rope: true
+  rope_base: 500000.0
+  use_focus_decay: true
   retention_heads: 1
   retention_latent_dim: 256            # d_L
   phi_act: "silu"
@@ -26,10 +32,11 @@ model:
   use_lora_deembed: true
   lora_deembed_rank: 128               # r = 128
   chunk_size: 512
+  use_chunked_scan: true
   rms_norm_eps: 1.0e-6
   initializer_range: 0.02
+  dropout: 0.0
 
-# Progressive Curriculum Schedule (128 -> 65.5k)
 curriculum:
   stages:
     - name: "Stage 1 (128)"
@@ -79,3 +86,4 @@ training:
 data:
   dataset_name: "HuggingFaceFW/fineweb"
   tokenizer_name: "HuggingFaceTB/SmolLM3-3B"
+  buffer_size: 10000

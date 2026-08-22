@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
-from .configure_mockd17B import MockD1Config
+from .configure_mockd1_mini import MockD1Config
 from .feedforward import RMSNorm
 from .block import MockD1Block
 
@@ -37,19 +37,22 @@ class MockD1LoRADeEmbeddingHead(nn.Module):
         self.r = config.lora_deembed_rank
 
         if self.use_lora:
-            # Low-rank factor A: [D_E, r] = [3072, 256]
+            # Low-rank factor A: [D_E, r]
             self.lora_A = nn.Parameter(torch.empty(config.hidden_dim, self.r))
-            # Low-rank factor B: [r, VocabSize] = [256, 262144]
+            # Low-rank factor B: [r, VocabSize]
             self.lora_B = nn.Parameter(torch.empty(self.r, config.vocab_size))
             
             init_laplace_weights_(self.lora_A, scale=config.initializer_range, min_val=-1.0, max_val=1.0)
             nn.init.zeros_(self.lora_B)
+        else:
+            self.register_parameter("lora_A", None)
+            self.register_parameter("lora_B", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Base shared de-embedding: [B, C, D_E] @ [D_E, Vocab] -> [B, C, Vocab]
         logits = F.linear(x, self.shared_embed.weight)
 
-        if self.use_lora:
+        if self.use_lora and self.lora_A is not None and self.lora_B is not None:
             # Low-rank residual path: [B, C, D_E] @ [D_E, r] @ [r, Vocab]
             lora_out = torch.matmul(x, self.lora_A)
             lora_out = torch.matmul(lora_out, self.lora_B)
@@ -66,6 +69,12 @@ class MockD1Model(nn.Module):
         self.blocks = nn.ModuleList([MockD1Block(config) for _ in range(config.num_blocks)])
         self.norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
+
+    def get_num_params(self, trainable_only: bool = False) -> int:
+        """Returns total parameter count of the base model."""
+        if trainable_only:
+            return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return sum(p.numel() for p in self.parameters())
 
     def forward(
         self,
@@ -121,6 +130,14 @@ class MockD1ForCausalLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             init_laplace_weights_(module.weight, scale=self.config.initializer_range, min_val=-1.0, max_val=1.0)
 
+    def get_num_params(self, trainable_only: bool = False) -> int:
+        """Returns total parameter count of the causal LM (accounting for tied weights)."""
+        if trainable_only:
+            return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        # Note: model.embed_tokens and lm_head.shared_embed share parameters
+        unique_params = set(self.parameters())
+        return sum(p.numel() for p in unique_params)
+
     def gradient_checkpointing_enable(self):
         """Enables activation checkpointing across all transformer blocks."""
         self.model.gradient_checkpointing = True
@@ -157,23 +174,29 @@ class MockD1ForCausalLM(nn.Module):
         input_ids: torch.LongTensor,
         max_new_tokens: int = 64,
         temperature: float = 1.0,
-        top_k: int = 50
+        top_k: int = 50,
+        eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Fast token-by-token autoregressive generation using recurrent state carry.
+        Compatible with CPU, Single-GPU, and Multi-GPU setups.
         """
         self.eval()
         B, seq_len = input_ids.shape
         device = input_ids.device
+        dtype = next(self.parameters()).dtype
+
+        head_dim = self.config.focus_head_dim
+        num_heads = self.config.focus_heads
 
         # 1. Initialize empty recurrent states across all blocks
         past_states = []
         for _ in range(self.config.num_blocks):
             block_states = [
-                torch.zeros(B, self.config.focus_heads, self.config.focus_head_dim, self.config.focus_head_dim, device=device), # F1
-                torch.zeros(B, self.config.focus_heads, self.config.focus_head_dim, self.config.focus_head_dim, device=device), # F2
-                torch.zeros(B, self.config.focus_heads, self.config.focus_head_dim, self.config.focus_head_dim, device=device), # F3
-                {"l_kv_cache": None, "running_S": None}                                                                         # Retention
+                torch.zeros(B, num_heads, head_dim, head_dim, device=device, dtype=dtype), # F1
+                torch.zeros(B, num_heads, head_dim, head_dim, device=device, dtype=dtype), # F2
+                torch.zeros(B, num_heads, head_dim, head_dim, device=device, dtype=dtype), # F3
+                {"l_kv_cache": None, "running_S": None}                                    # Retention
             ]
             past_states.append(block_states)
 
@@ -200,6 +223,9 @@ class MockD1ForCausalLM(nn.Module):
                 next_token = torch.argmax(last_logits, dim=-1, keepdim=True)
 
             generated = torch.cat([generated, next_token], dim=1)
+
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
 
             # Single token forward step
             logits, _, past_states = self.forward(next_token, past_states=past_states, seq_offset=curr_pos)

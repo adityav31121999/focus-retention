@@ -1,19 +1,19 @@
 """
-End-to-End 36-Layer Tensor Dimension Verification Suite
-Focus-Retention Architecture (Mock-D1:7B)
+End-to-End 36-Layer Tensor Dimension & Parameter Verification Suite
+Focus-Retention Architecture (Mock-D1: 1.7B Mini Model & 7B Full Model)
 
-Tests all 36 layers (9 blocks x (3 Focus + 1 Retention)) in:
-1. Parallel Sequence Mode (Training & Loss Backprop)
-2. Recurrent Autoregressive Mode (Inference Step-by-Step with MockD1StateCache)
-3. Layer-by-layer intermediate tensor shapes
+Tests:
+1. Preset parameter count verification (1.7B and 7B configurations)
+2. Full 36-layer model shapes during parallel forward & backward pass on CPU
+3. Layer-by-layer intermediate tensor shapes for MockD1Block
+4. Autoregressive step decoding with MockD1StateCache
 """
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from mock_d1.configure_mockd17B import MockD1Config
-from mock_d1.model_mock import MockD1ForCausalLM, MockD1Model
+from mock_d1 import MockD1Config, MockD1Config7B, MockD1Config1_7B, MockD1ForCausalLM, MockD1Model
 from mock_d1.block import MockD1Block
 from mock_d1.focus import MockD1FocusAttention
 from mock_d1.retention import MockD1RetentionMechanism
@@ -21,8 +21,26 @@ from mock_d1.feedforward import MockD1MLP, RMSNorm
 from inference.cache import MockD1StateCache
 
 
+def test_parameter_counts():
+    """Verify 1.7B and 7B parameter counts align with design specifications."""
+    # 1.7B Mini Model
+    cfg_1_7b = MockD1Config.get_1_7b_config()
+    breakdown_1_7b = cfg_1_7b.count_parameters()
+    total_1_7b = breakdown_1_7b["total_parameters"]
+    print(f"\n[INFO] 1.7B Model Theoretical Params: {total_1_7b:,} ({total_1_7b / 1e9:.2f}B)")
+    assert 1.4e9 <= total_1_7b <= 1.9e9, f"Expected ~1.7B params, got {total_1_7b}"
+
+    # 7B Full Model
+    cfg_7b = MockD1Config.get_7b_config()
+    breakdown_7b = cfg_7b.count_parameters()
+    total_7b = breakdown_7b["total_parameters"]
+    print(f"[INFO] 7B Model Theoretical Params: {total_7b:,} ({total_7b / 1e9:.2f}B)")
+    assert 6.5e9 <= total_7b <= 7.8e9, f"Expected ~7.1B params, got {total_7b}"
+    print("[PASS] Parameter Count Assertions Passed!")
+
+
 def test_36_layer_model_dimensions():
-    """Verify full 36-layer (9-block) model shapes during parallel forward and backward pass."""
+    """Verify full 36-layer (9-block) model shapes during parallel forward and backward pass on CPU."""
     torch.manual_seed(42)
     B, C = 2, 16
     
@@ -90,13 +108,13 @@ def test_layer_by_layer_block_dimensions():
     step_x = torch.randn(B, 1, config.hidden_dim)
     step_x0 = torch.randn(B, 1, config.hidden_dim)
     
-    # Initialize cache states: 3 Focus tensors + 1 Retention (empty dict)
+    # Initialize cache states: 3 Focus tensors + 1 Retention
     head_dim = config.focus_head_dim
     initial_states = [
         torch.zeros(B, config.focus_heads, head_dim, head_dim),
         torch.zeros(B, config.focus_heads, head_dim, head_dim),
         torch.zeros(B, config.focus_heads, head_dim, head_dim),
-        {}  # Retention state dictionary
+        {"l_kv_cache": None, "running_S": None}
     ]
 
     out_step1, new_states1 = block(step_x, x0=step_x0, states=initial_states)
@@ -149,6 +167,7 @@ def test_autoregressive_state_cache_generation():
 
 
 if __name__ == "__main__":
+    test_parameter_counts()
     test_36_layer_model_dimensions()
     test_layer_by_layer_block_dimensions()
     test_autoregressive_state_cache_generation()

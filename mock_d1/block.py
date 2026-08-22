@@ -2,7 +2,7 @@
 from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
-from .configure_mockd17B import MockD1Config
+from .configure_mockd1_mini import MockD1Config
 from .feedforward import RMSNorm, MockD1MLP
 from .focus import MockD1FocusAttention
 from .retention import MockD1RetentionMechanism

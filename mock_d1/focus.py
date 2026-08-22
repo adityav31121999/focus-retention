@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .configure_mockd17B import MockD1Config
+from .configure_mockd1_mini import MockD1Config
 
 
 class FocusRoPE(nn.Module):
@@ -81,7 +81,6 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
             carry_decay = (gamma ** power) * curr_state.unsqueeze(2)  # [B, H, L, d_h, d_h]
 
             # 2. Intra-chunk accumulated contribution via batched matrix multiply
-            # decay_c: [1, H, L, L] @ [B, H, L, d_h * d_h] -> [B, H, L, d_h, d_h]
             decay_c = decay_weights[:, :curr_len, :curr_len].unsqueeze(0)
             P_flat = P_c.view(B, H, curr_len, d_h * d_h)
             intra_accum = torch.matmul(decay_c, P_flat).view(B, H, curr_len, d_h, d_h)
@@ -179,41 +178,33 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
 class FocusAttentionFunction(torch.autograd.Function):
     """Reference Small-Context Autograd (Stages 1-4)."""
     @staticmethod
-    def forward(
-        self,
-        x: torch.Tensor,
-        state: Optional[torch.Tensor] = None,
-        seq_offset: int = 0
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        B, C, _ = x.shape
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gamma: torch.Tensor, scale: float):
+        # q, k, v: [B, H, C, d_h], gamma: [1, H, 1, 1]
+        B, H, C, d_h = q.shape
 
-        q = self.q_proj(x).view(B, C, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, C, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, C, self.num_heads, self.head_dim).transpose(1, 2)
+        M = torch.zeros(B, H, C, d_h, d_h, device=q.device, dtype=q.dtype)
+        S = torch.zeros(B, H, C, d_h, d_h, device=q.device, dtype=q.dtype)
+        A = torch.zeros(B, H, C, d_h, device=q.device, dtype=q.dtype)
 
-        # Apply RoPE using the true sequence offset
-        if self.use_rope:
-            q = self.rope(q, seq_len=C, offset=seq_offset)
-            k = self.rope(k, seq_len=C, offset=seq_offset)
+        curr_M = torch.zeros(B, H, d_h, d_h, device=q.device, dtype=q.dtype)
 
-        gamma = torch.exp(-torch.exp(self.decay_param))
+        for t in range(C):
+            q_t = q[:, :, t]  # [B, H, d_h]
+            k_t = k[:, :, t]  # [B, H, d_h]
+            v_t = v[:, :, t]  # [B, H, d_h]
 
-        if state is None:
-            # Parallel training path
-            if (self.config.curriculum_stage == 5 or self.config.use_chunked_scan) and C > self.chunk_size:
-                A = ChunkedFocusAttentionFunction.apply(q, k, v, gamma, self.scale, self.chunk_size)
-            else:
-                A = FocusAttentionFunction.apply(q, k, v, gamma, self.scale)
-            next_state = None
-        else:
-            # Recurrent inference path
-            delta_M = self.scale * torch.matmul(q.transpose(-1, -2), k)  # [B, H, d_h, d_h]
-            next_state = gamma * state + delta_M
-            S = F.softmax(next_state, dim=-1)
-            A = torch.matmul(v, S)
+            delta_M = scale * torch.matmul(q_t.unsqueeze(-1), k_t.unsqueeze(-2))  # [B, H, d_h, d_h]
+            curr_M = gamma * curr_M + delta_M
+            curr_S = F.softmax(curr_M, dim=-1)
+            curr_A = torch.matmul(v_t.unsqueeze(-2), curr_S).squeeze(-2)  # [B, H, d_h]
 
-        A = A.transpose(1, 2).contiguous().view(B, C, self.kqv_dim)
-        return self.o_proj(A), next_state
+            M[:, :, t] = curr_M
+            S[:, :, t] = curr_S
+            A[:, :, t] = curr_A
+
+        ctx.save_for_backward(q, k, v, S, gamma, M)
+        ctx.scale = scale
+        return A
 
     @staticmethod
     def backward(ctx, grad_A: torch.Tensor):

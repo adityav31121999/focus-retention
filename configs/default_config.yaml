@@ -1,57 +1,63 @@
 # ==============================================================================
-# Mock-D1 (7B Class) Architecture Configuration (default_config.yaml)
+# Mock-D1 Architecture Configuration (default_config.yaml)
+# Defaults to Mock-D1:1.7B Mini Model for Kaggle / Single-GPU Training
+# For 7B Model training, use configs/7b_config.yaml or pass --model_size 7B
 # ==============================================================================
 
 model:
-  # General Dimensions
-  vocab_size: 262144                   # Gemma Vocab (2^18)
-  max_seq_len: 262144                  # Context window C_W (2^18)
-  hidden_dim: 3072                     # D_E
-  kqv_dim: 4096                        # D_KQV
-  intermediate_dim: 12288              # D_FFN (SwiGLU)
+  model_name: "Mock-D1-1.7B"
+  vocab_size: 128256                   # SmolLM3 Tokenizer Vocab
+  max_seq_len: 65536                   # Context Window (64k)
+  hidden_dim: 1536                     # D_E
+  kqv_dim: 2304                        # D_KQV (18 heads * 128 head_dim)
+  intermediate_dim: 6144               # D_FFN (SwiGLU)
   
   # Block & Layer Topology
   num_layers: 36                       # N_L
   num_blocks: 9                        # N_B = 36 / (3 + 1)
-  focus_layers_per_block: 3            # N_F (27 Focus layers total)
-  retention_layers_per_block: 1        # N_R (9 Retention layers total)
+  focus_layers_per_block: 3            # 27 Focus layers total
+  retention_layers_per_block: 1        # 9 Retention layers total
   
-  # Focus Attention Weights
-  focus_heads: 32                      # N_H
-  # d_h (Head Dim) = 4096 / 32 = 128
+  # Focus Attention
+  focus_heads: 18                      # N_H = 18 (d_h = 128)
+  use_rope: true
+  rope_base: 500000.0
+  use_focus_decay: true
   
-  # Retention Weights
+  # Retention Mechanism
   retention_heads: 1
-  retention_latent_dim: 512            # d_L (Latent KV-cache dimension)
+  retention_latent_dim: 256            # d_L (Latent KV cache dimension)
   phi_act: "silu"
   
   # Embeddings & LoRA De-Embedding Head
   tie_word_embeddings: true
   use_lora_deembed: true
-  lora_deembed_rank: 256               # r = 256
+  lora_deembed_rank: 128               # r = 128
   
-  # Normalization & Regularization
+  # Scan & Regularization
+  chunk_size: 512
+  use_chunked_scan: true
   rms_norm_eps: 1.0e-6
   initializer_range: 0.02
   dropout: 0.0
 
 training:
-  learning_rate: 2.5e-4
+  learning_rate: 3.5e-4
   min_lr_ratio: 0.1
   weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
   max_grad_norm: 1.0
-  warmup_steps: 2000
-  max_steps: 100000
-  batch_size: 1
-  gradient_accumulation_steps: 32
+  warmup_steps: 1000
+  max_steps: 50000
+  batch_size: 2
+  gradient_accumulation_steps: 16
   save_every: 2500
   eval_every: 500
-  output_dir: "./checkpoints/mock_d1_7b"
+  output_dir: "./checkpoints/mock_d1_1_7b"
 
 data:
   dataset_name: "HuggingFaceFW/fineweb"
-  tokenizer_name: "google/gemma-7b"     # 262,144 Vocab Tokenizer
-  seq_len: 4096                        # Chunk length during standard pretraining
-  buffer_size: 20000
+  tokenizer_name: "HuggingFaceTB/SmolLM3-3B"
+  seq_len: 2048
+  buffer_size: 10000
