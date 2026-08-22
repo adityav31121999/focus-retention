@@ -30,7 +30,7 @@ Following is the breakdown:
 - `C` will be concated `A` from each head as $C = concat(A)$. Further: $L = C \times W_O$
 - FFN is used to process `L` as $X = f_{FFN}(L)$
 
-This is similar to linear attention, but instead of $QK^TV$, we take $VQ^TK$. If we look closely, this almost looks similar, instead of doing feature extractions, we apply softmax. The content is also in `K` and `Q`, if we have to go by standard definition, this will blur the past, but if we consider this as new mechanism, and ignore the standard vanilla transformer, this attention is doing same thing as linear attention but more on vanilla standard manner.
+This is similar to linear attention, but instead of $QK^TV$, we take $VQ^TK$. If we look closely, this almost looks similar, instead of doing feature extractions, we apply softmax. The content is also in $Q$ and $K$, if we have to go by standard definition, this will blur the past, but if we consider this as new mechanism, and ignore the standard vanilla transformer, this attention is doing same thing as linear attention but more on vanilla standard manner.
 
 > Added Decay Factor ($\gamma$) for $M_{i-1}$ so that we do not accumulate all past and corrupt the future predictions. If we let the accumulation for longer context, we meight end up with values too large or too small.
 
@@ -42,13 +42,13 @@ $$\gamma \in (0.1, 0.9)$$
 
 ## RETENTION MECHANISM
 
-The retention mechanism is just reverse engineered attention mechanism, starting from
+The retention mechanism is just reverse engineered attention mechanism, starting from:
 $$A_i = \alpha_i \times V$$
 This $\alpha_i$ is the softmax of $S_i$ which is defined as:
 $$\alpha_i = softmax(S_i)$$
 $$S_i = S_{i-1} + \phi(Q_i \times K^T)$$
 
-The recursive relation with previous `S` helps in keeping the past history alive in current step and the $\phi(Q_i \times K^T)$ is current steps history. $\phi$ is the feature extraction function, unlike linear attention, this is activates the Q and K. Softmax is applied on `S` to form $\alpha$ and then retention happens with this probability distribution i.e., whichever token has more contribution in selecting new tokens has more probability than others and only those value vectors contribute with it.
+The recursive relation with previous `S` helps in keeping the past history alive in current step and the $\phi(Q_i \times K^T)$ is current steps history. $\phi$ is the feature extraction function, unlike linear attention, this is activates the $Q$ and $K$. Softmax is applied on `S` to form $\alpha$ and then retention happens with this probability distribution i.e., whichever token has more contribution in selecting new tokens has more probability than others and only those value vectors contribute with it.
 
 To overcome the blurriness problem of focus attention, we take global retention.
 
@@ -66,9 +66,9 @@ For memory footprint reduction, we will use concept similar to Deepseek MHLA.
 
 ## Un-Embedding
 
-De-embedding or un-embedding will be used to produce output of transformer, which will be softmaxed to get probability distribution.
+De-embedding or un-embedding will be used to produce output of transformer, which will be softmaxed to get probability distribution. To get this un-embedding, we add product of $A$ and $B$ to $E$. These $A$ and $B$ are LoRA adapters.
 
-$$D = E + 
+$$D = E^T + (A \times B)$$
 
 ---
 
@@ -330,3 +330,9 @@ Token injection maintains the continuity of original information, while residual
    - Per Layer: $\approx 36.96\text{M} \implies 9 \times 36.96\text{M} \approx \mathbf{0.333\text{ B}}$
 4. **LoRA De-Embedding Head ($r=128$)**: $(1536 \times 128) + (128 \times 128256) \approx \mathbf{0.017\text{ B}}$
 5. **Total Model Parameters**: $\mathbf{\approx 1.694\text{ Billion Parameters}}$ (~1.7B Model)
+
+### Training
+
+1. **Adafactor** for stage 1 to 3, and **Muon** for stage 4 and 5.
+2. Weights are updated after each sentence, and after every session (which is 1hr long) weights are saved.
+3. Tracking for dataset is also done, so that training continued from where it left.

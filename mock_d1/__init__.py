@@ -1,3 +1,4 @@
+# __init__.py
 from .configure_mockd1_mini import MockD1Config, MockD1Config7B, MockD1Config1_7B
 from .model_mock import MockD1ForCausalLM, MockD1Model, MockD1LoRADeEmbeddingHead
 from .focus import MockD1FocusAttention

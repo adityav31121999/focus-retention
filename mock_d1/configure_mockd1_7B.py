@@ -1,4 +1,4 @@
-# configure_mockd17B.py
+# configure_mockd1_7B.py
 # Backward-compatibility forwarding module
 from .configure_mockd1_mini import MockD1Config, MockD1Config7B, MockD1Config1_7B
 

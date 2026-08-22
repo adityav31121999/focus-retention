@@ -1,36 +1,41 @@
 # ==============================================================================
-# Mock-D1 Progressive Curriculum Configuration (curriculum_config.yaml)
-# Defaults to Mock-D1:1.7B Mini Model (Stages 1 to 5)
-# For 7B Model, use configs/7b_curriculum.yaml or pass --model_size 7B
+# Mock-D1 (1.7B Mini Class) Progressive Curriculum Configuration
+# Sentence-by-Sentence Updates (Batch Size = 1, Accumulation = 1)
+# Dynamic Optimizer: Adafactor (Stages 1–3) -> Muon (Stages 4–5)
+# Sequential Multi-Dataset Chaining with Automatic Epoch Cycling
 # ==============================================================================
 
 model:
   model_name: "Mock-D1-1.7B"
-  vocab_size: 128256                   # SmolLM3 Tokenizer Vocab
-  max_seq_len: 65536                   # Context Window (64k)
+  vocab_size: 128256                   # SmolLM3 Tokenizer Vocab (128k)
+  max_seq_len: 65536                   # Architectural Context Limit (64k)
   hidden_dim: 1536                     # D_E
   kqv_dim: 2304                        # D_KQV (18 heads * 128 head_dim)
   intermediate_dim: 6144               # D_FFN (SwiGLU)
   
-  # Topology
-  num_layers: 36                       # 36 Layers Total
-  num_blocks: 9                        # 9 Blocks
-  focus_layers_per_block: 3            # 27 Focus Layers Total
-  retention_layers_per_block: 1        # 9 Retention Layers Total
+  # Block & Layer Topology (9 Blocks * (3 Focus + 1 Retention) = 36 Layers)
+  num_layers: 36                       # N_L = 36
+  num_blocks: 9                        # N_B = 9
+  focus_layers_per_block: 3            # N_F = 3 (27 Focus layers total)
+  retention_layers_per_block: 1        # N_R = 1 (9 Retention layers total)
   
-  # Attention Heads & Retention
-  focus_heads: 18                      # 18 Focus Heads (d_h = 128)
+  # Focus Attention
+  focus_heads: 18                      # N_H = 18 (d_h = 2304 / 18 = 128)
   use_rope: true
   rope_base: 500000.0
   use_focus_decay: true
+  
+  # Global Retention Mechanism (Latent KV)
   retention_heads: 1
-  retention_latent_dim: 256            # d_L
+  retention_latent_dim: 256            # d_L (Latent KV-cache dimension)
   phi_act: "silu"
   
-  # Embeddings & Regularization
+  # Embeddings & LoRA De-Embedding Head
   tie_word_embeddings: true
   use_lora_deembed: true
   lora_deembed_rank: 128               # r = 128
+  
+  # Scan & Regularization
   chunk_size: 512
   use_chunked_scan: true
   rms_norm_eps: 1.0e-6
@@ -39,39 +44,44 @@ model:
 
 curriculum:
   stages:
-    - name: "Stage 1 (128)"
+    - name: "Stage 1 (128)  [Adafactor]"
       seq_len: 128
-      batch_size: 16
-      gradient_accumulation_steps: 2
-      lr: 4.0e-4
+      batch_size: 1
+      gradient_accumulation_steps: 1
+      optimizer: "adafactor"
+      lr: 1.0e-3
       max_steps: 10000
 
-    - name: "Stage 2 (512)"
+    - name: "Stage 2 (512)  [Adafactor]"
       seq_len: 512
-      batch_size: 8
-      gradient_accumulation_steps: 4
-      lr: 3.5e-4
+      batch_size: 1
+      gradient_accumulation_steps: 1
+      optimizer: "adafactor"
+      lr: 8.0e-4
       max_steps: 25000
 
-    - name: "Stage 3 (2048)"
+    - name: "Stage 3 (2048) [Adafactor]"
       seq_len: 2048
-      batch_size: 4
-      gradient_accumulation_steps: 4
-      lr: 2.5e-4
+      batch_size: 1
+      gradient_accumulation_steps: 1
+      optimizer: "adafactor"
+      lr: 5.0e-4
       max_steps: 50000
 
-    - name: "Stage 4 (8192)"
-      seq_len: 8192
-      batch_size: 2
-      gradient_accumulation_steps: 8
-      lr: 1.5e-4
+    - name: "Stage 4 (4096) [Muon]"
+      seq_len: 4096
+      batch_size: 1
+      gradient_accumulation_steps: 1
+      optimizer: "muon"
+      lr: 2.0e-2
       max_steps: 75000
 
-    - name: "Stage 5 (Full Context: 65.5k)"
-      seq_len: 65536
+    - name: "Stage 5 (4096) [Muon]"
+      seq_len: 4096                    # Capped at 4096 for single-GPU stability (can be set up to 65536)
       batch_size: 1
-      gradient_accumulation_steps: 2
-      lr: 8.0e-5
+      gradient_accumulation_steps: 1
+      optimizer: "muon"
+      lr: 1.0e-2
       max_steps: 100000
 
 training:
@@ -79,11 +89,22 @@ training:
   beta1: 0.9
   beta2: 0.95
   max_grad_norm: 1.0
-  warmup_steps: 1000
-  save_every: 2500
+  warmup_steps: 500
+  min_lr_ratio: 0.1
+  save_every: 500                      # Save checkpoint every 500 steps
+  session_duration_minutes: 55.0       # 1-Hour Session Timer (55m runtime + 5m checkpoint buffer)
+  keep_last_n_checkpoints: 2           # Automatic pruning to protect Google Drive quota
   output_dir: "./checkpoints/mock_d1_1_7b"
 
 data:
-  dataset_name: "HuggingFaceFW/fineweb"
-  tokenizer_name: "HuggingFaceTB/SmolLM3-3B"
+  tokenizer_name: "HuggingFaceTB/SmolLM3-3B"   # 128,256 Vocab Tokenizer
   buffer_size: 10000
+  split: "train"
+  seed: 42
+  # Sequential Multi-Dataset Pipeline:
+  # Streams through Dataset 1 -> Dataset 2 -> Increments Epoch -> Loops back to Dataset 1
+  datasets:
+    - name: "roneneldan/TinyStories"
+      config: null
+    - name: "HuggingFaceTB/smollm-corpus"
+      config: "cosmopedia-v2"

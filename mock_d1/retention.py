@@ -32,6 +32,7 @@ def _dphi(score: torch.Tensor, phi_act: str) -> torch.Tensor:
 class ChunkedRetentionFunction(torch.autograd.Function):
     """
     Stage 5 Policy: Chunked Retention without materializing O(C^2) matrices in VRAM.
+    Maintains exact mathematical equivalence with full cumulative scan.
     """
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float, phi_act: str, chunk_size: int):
@@ -39,16 +40,8 @@ class ChunkedRetentionFunction(torch.autograd.Function):
         num_chunks = (C + chunk_size - 1) // chunk_size
         A = torch.empty_like(v)
 
-        # Boundary prefix history for recurrence across chunks: [num_chunks + 1, B, 1, D]
-        saved_q = []
-        saved_k = []
-        saved_v = []
-        saved_alpha = []
-        saved_score = []
-
-        # Running history tensor
-        running_history = torch.zeros(B, 1, D, device=q.device, dtype=q.dtype)
-        boundary_histories = [running_history]
+        # Boundary prefix state carrying accumulated S across chunk boundaries
+        running_prefix_S = torch.empty(0, device=q.device, dtype=q.dtype)
 
         for c_idx in range(num_chunks):
             start = c_idx * chunk_size
@@ -57,22 +50,26 @@ class ChunkedRetentionFunction(torch.autograd.Function):
 
             q_c = q[:, start:end]  # [B, L, D]
             k_c = k[:, :end]       # [B, end, D]
-            v_c = v[:, :end]
+            v_c = v[:, :end]       # [B, end, D]
 
             causal_mask = torch.tril(torch.ones(curr_len, end, device=q.device, dtype=torch.bool), diagonal=start)
             score_c = torch.matmul(q_c, k_c.transpose(-1, -2)) * scale
             phi_c = _phi(score_c, phi_act).masked_fill(~causal_mask, 0.0)
 
-            # Intra-chunk cumulative sum
+            # Intra-chunk cumulative sum along query dimension
             S_c = torch.cumsum(phi_c, dim=-2)
+
+            # Add prefix accumulated sum from preceding chunks
+            if c_idx > 0:
+                S_c[:, :, :start] += running_prefix_S
+
+            # Save the last row of S_c as prefix carry for subsequent chunks
+            running_prefix_S = S_c[:, -1:, :end]
+
             S_c_masked = S_c.masked_fill(~causal_mask, float("-inf"))
             alpha_c = F.softmax(S_c_masked, dim=-1)
 
             A[:, start:end] = torch.matmul(alpha_c, v_c)
-
-            saved_q.append(q_c)
-            saved_score.append(score_c)
-            saved_alpha.append(alpha_c)
 
         ctx.save_for_backward(q, k, v)
         ctx.scale = scale
@@ -93,7 +90,11 @@ class ChunkedRetentionFunction(torch.autograd.Function):
         grad_K = torch.zeros_like(k)
         grad_V = torch.zeros_like(v)
 
-        for c_idx in range(num_chunks):
+        # Boundary prefix carry for reverse suffix gradient accumulation
+        # Shape accumulates over active key dimensions [B, 1, C]
+        running_grad_prefix = torch.zeros(B, 1, C, device=q.device, dtype=q.dtype)
+
+        for c_idx in reversed(range(num_chunks)):
             start = c_idx * chunk_size
             end = min(start + chunk_size, C)
             curr_len = end - start
@@ -103,28 +104,48 @@ class ChunkedRetentionFunction(torch.autograd.Function):
             v_c = v[:, :end]
             gA_c = grad_A[:, start:end]
 
+            # Recompute S_c on-the-fly for this chunk
             causal_mask = torch.tril(torch.ones(curr_len, end, device=q.device, dtype=torch.bool), diagonal=start)
             score_c = torch.matmul(q_c, k_c.transpose(-1, -2)) * scale
             phi_c = _phi(score_c, phi_act).masked_fill(~causal_mask, 0.0)
-            S_c = torch.cumsum(phi_c, dim=-2)
+
+            # Recompute full prefix up to start
+            if start > 0:
+                full_q_prefix = q[:, :start]
+                full_k_prefix = k[:, :start]
+                full_score_prefix = torch.matmul(full_q_prefix, full_k_prefix.transpose(-1, -2)) * scale
+                full_mask_prefix = torch.tril(torch.ones(start, start, device=q.device, dtype=torch.bool))
+                full_phi_prefix = _phi(full_score_prefix, phi_act).masked_fill(~full_mask_prefix, 0.0)
+                prefix_sum = torch.sum(full_phi_prefix, dim=-2, keepdim=True)
+                S_c = torch.cumsum(phi_c, dim=-2)
+                S_c[:, :, :start] += prefix_sum
+            else:
+                S_c = torch.cumsum(phi_c, dim=-2)
+
             alpha_c = F.softmax(S_c.masked_fill(~causal_mask, float("-inf")), dim=-1)
 
-            # Grad V
+            # 1. Grad V
             grad_V[:, :end] += torch.matmul(alpha_c.transpose(-1, -2), gA_c)
 
-            # Grad alpha & Softmax VJP
+            # 2. Grad alpha & Softmax VJP
             grad_alpha_c = torch.matmul(gA_c, v_c.transpose(-1, -2))
             sum_grad_alpha = torch.sum(grad_alpha_c * alpha_c, dim=-1, keepdim=True)
             grad_S_c = torch.where(causal_mask, alpha_c * (grad_alpha_c - sum_grad_alpha), torch.zeros_like(alpha_c))
 
-            # Reverse suffix scan along query axis
+            # 3. Reverse suffix scan within chunk + downstream carry
             grad_phi_c = torch.flip(torch.cumsum(torch.flip(grad_S_c, dims=[-2]), dim=-2), dims=[-2])
+            if c_idx < num_chunks - 1:
+                grad_phi_c += running_grad_prefix[:, :, :end]
+
             grad_phi_c = torch.where(causal_mask, grad_phi_c, torch.zeros_like(grad_phi_c))
 
-            # Score grad
+            # Update running suffix carry propagating backwards to upstream chunks
+            running_grad_prefix[:, :, :end] += torch.sum(grad_S_c, dim=-2, keepdim=True)
+
+            # 4. Score gradient
             grad_score_c = grad_phi_c * _dphi(score_c, phi_act)
 
-            # Grad Q and K
+            # 5. Grad Q and K
             grad_Q[:, start:end] += torch.matmul(grad_score_c, k_c) * scale
             grad_K[:, :end] += torch.matmul(grad_score_c.transpose(-1, -2), q_c) * scale
 
@@ -211,7 +232,6 @@ class MockD1RetentionMechanism(nn.Module):
             prev_l_kv = state.get("l_kv_cache", None)
             prev_S = state.get("running_S", None)
             l_kv_all = torch.cat([prev_l_kv, l_kv_curr], dim=1) if prev_l_kv is not None else l_kv_curr
-            t_total = l_kv_all.shape[1]
 
             k_all = self.w_k_expand(l_kv_all)
             v_all = self.w_v_expand(l_kv_all)

@@ -1,4 +1,4 @@
-# configure_mockd1.py
+# configure_mockd1_mini.py
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any
 import yaml
