@@ -1,4 +1,3 @@
-# scripts/train_curriculum.py
 import os
 import sys
 import argparse
@@ -98,31 +97,21 @@ def main():
               f"Accum: {st.get('gradient_accumulation_steps', 1)}, Opt: {opt_name}, Max Steps: {st['max_steps']:,}")
     print("=" * 65 + "\n")
 
-    # 5. Initialize Multi-Dataset Sequential Streamer
-    datasets_list = cfg["data"].get("datasets", None)
-    if datasets_list:
-        print(f"📚 Dataset Pipeline: {len(datasets_list)} chained datasets configured.")
-        for idx, ds in enumerate(datasets_list):
-            print(f"   [{idx + 1}] {ds['name']} (subset: {ds.get('config', 'default')})")
-    else:
-        datasets_list = [{"name": cfg["data"]["dataset_name"], "config": cfg["data"].get("dataset_config", None)}]
-
+    # 5. Initialize State-Aware Streamer
     streamer = CurriculumStreamer(
-        tokenizer=tokenizer,
-        datasets_list=datasets_list,
-        dataset_name=cfg["data"].get("dataset_name", "roneneldan/TinyStories"),
+        dataset_name=cfg["data"]["dataset_name"],
         dataset_config=cfg["data"].get("dataset_config", None),
+        tokenizer=tokenizer,
         initial_seq_len=cfg["curriculum"]["stages"][0]["seq_len"],
         split=cfg["data"].get("split", "train"),
-        buffer_size=cfg["data"].get("buffer_size", 10000),
-        seed=cfg["data"].get("seed", 42)
+        buffer_size=cfg["data"].get("buffer_size", 10000)
     )
 
     # 6. Initialize Checkpoint Manager with Auto-Pruning
     keep_last_n = cfg["training"].get("keep_last_n_checkpoints", 2)
     ckpt_manager = CheckpointManager(cfg["training"]["output_dir"], keep_last_n=keep_last_n)
 
-    # 7. Restore Model Weights, Optimizer Type, Dataset Offsets, and Epoch
+    # 7. Restore Model, Optimizer, and Dataset Offset State
     start_step, opt_type, streamer_state = ckpt_manager.load_latest(model=model, streamer=streamer)
 
     # 8. Configure Session Duration
@@ -144,7 +133,7 @@ def main():
     )
 
     # 10. Execute Training Session
-    print(f"🎬 Commencing training session at Step {start_step} (Timer: {session_minutes} mins)...")
+    print(f"🎬 Starting training session at Step {start_step} (Timer: {session_minutes} mins)...")
     trainer.train(start_step=start_step)
 
 

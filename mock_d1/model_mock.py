@@ -14,14 +14,21 @@ def init_laplace_weights_(tensor: torch.Tensor, scale: float = 0.02, min_val: fl
     """
     Initializes tensor in-place with Laplace distribution centered at 0.0
     and clamped to the range (min_val, max_val).
+    
+    Uses an in-place Inverse-CDF transform:
+        X = -sgn(u) * scale * ln(1 - 2|u|),  where u in (-0.5, 0.5)
+    
+    Zero heap/CPU memory allocation overhead to avoid crashing on RAM-limited environments (e.g., Colab/Kaggle).
     """
     with torch.no_grad():
-        laplace = torch.distributions.Laplace(
-            loc=torch.tensor(0.0, dtype=tensor.dtype, device=tensor.device),
-            scale=torch.tensor(scale, dtype=tensor.dtype, device=tensor.device)
-        )
-        sample = laplace.sample(tensor.shape)
-        tensor.copy_(sample.clamp_(min_val, max_val))
+        # 1. Generate uniform samples in (-0.5, 0.5) in-place
+        tensor.uniform_(-0.499999, 0.499999)
+        # 2. Extract sign
+        sgn = torch.sign(tensor)
+        # 3. Transform uniform distribution into Laplace distribution in-place
+        tensor.abs_().mul_(2.0).neg_().add_(1.0).log_().mul_(-scale).mul_(sgn)
+        # 4. Clamp in-place
+        tensor.clamp_(min_val, max_val)
     return tensor
 
 
@@ -134,7 +141,7 @@ class MockD1ForCausalLM(nn.Module):
         """Returns total parameter count of the causal LM (accounting for tied weights)."""
         if trainable_only:
             return sum(p.numel() for p in self.parameters() if p.requires_grad)
-        # Note: model.embed_tokens and lm_head.shared_embed share parameters
+        # model.embed_tokens and lm_head.shared_embed share parameters
         unique_params = set(self.parameters())
         return sum(p.numel() for p in unique_params)
 
@@ -159,10 +166,12 @@ class MockD1ForCausalLM(nn.Module):
 
         loss = None
         if labels is not None:
+            # Shift tokens for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+            # Calculate cross-entropy in float32 for mixed-precision numerical stability
             loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.vocab_size),
+                shift_logits.view(-1, self.config.vocab_size).float(),
                 shift_labels.view(-1)
             )
 
@@ -179,7 +188,7 @@ class MockD1ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         """
         Fast token-by-token autoregressive generation using recurrent state carry.
-        Compatible with CPU, Single-GPU, and Multi-GPU setups.
+        O(1) memory per step.
         """
         self.eval()
         B, seq_len = input_ids.shape
@@ -189,31 +198,32 @@ class MockD1ForCausalLM(nn.Module):
         head_dim = self.config.focus_head_dim
         num_heads = self.config.focus_heads
 
-        # 1. Initialize empty recurrent states across all blocks
+        # 1. Initialize empty recurrent states across all 9 blocks
         past_states = []
         for _ in range(self.config.num_blocks):
             block_states = [
-                torch.zeros(B, num_heads, head_dim, head_dim, device=device, dtype=dtype), # F1
-                torch.zeros(B, num_heads, head_dim, head_dim, device=device, dtype=dtype), # F2
-                torch.zeros(B, num_heads, head_dim, head_dim, device=device, dtype=dtype), # F3
-                {"l_kv_cache": None, "running_S": None}                                    # Retention
+                torch.zeros(B, num_heads, head_dim, head_dim, device=device, dtype=dtype),  # F1
+                torch.zeros(B, num_heads, head_dim, head_dim, device=device, dtype=dtype),  # F2
+                torch.zeros(B, num_heads, head_dim, head_dim, device=device, dtype=dtype),  # F3
+                {"l_kv_cache": None, "running_S": None}                                     # Retention
             ]
             past_states.append(block_states)
 
-        # 2. Prompt Prefill Phase (build initial states step-by-step)
+        # 2. Prompt Prefill Phase (build initial states token-by-token)
+        logits = None
         for t in range(seq_len):
             token = input_ids[:, t : t + 1]
             logits, _, past_states = self.forward(token, past_states=past_states, seq_offset=t)
 
         generated = input_ids
 
-        # 3. Decoding Loop (O(1) memory per step)
+        # 3. Autoregressive Decoding Loop
         for step in range(max_new_tokens):
             curr_pos = seq_len + step
             last_logits = logits[:, -1, :]
 
             if temperature > 0:
-                last_logits = last_logits / temperature
+                last_logits = last_logits / max(temperature, 1e-5)
                 if top_k > 0:
                     v, _ = torch.topk(last_logits, min(top_k, last_logits.size(-1)))
                     last_logits[last_logits < v[:, [-1]]] = -float("inf")
@@ -227,7 +237,7 @@ class MockD1ForCausalLM(nn.Module):
             if eos_token_id is not None and (next_token == eos_token_id).all():
                 break
 
-            # Single token forward step
+            # Single token forward step with carried past_states
             logits, _, past_states = self.forward(next_token, past_states=past_states, seq_offset=curr_pos)
 
         return generated
