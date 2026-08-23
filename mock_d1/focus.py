@@ -8,6 +8,11 @@ from .configure_mockd1_mini import MockD1Config
 
 
 class FocusRoPE(nn.Module):
+    """
+    Dynamic on-demand Rotary Positional Embeddings.
+    Allocates an initial lightweight cache (~2k tokens) and dynamically grows,
+    preventing multi-gigabyte static VRAM allocation during model initialization.
+    """
     def __init__(self, dim: int, max_seq_len: int = 262144, base: float = 500000.0):
         super().__init__()
         self.dim = dim
@@ -15,7 +20,10 @@ class FocusRoPE(nn.Module):
         self.base = base
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._build_cache(max_seq_len)
+        self.register_buffer("cos_cached", torch.empty(0), persistent=False)
+        self.register_buffer("sin_cached", torch.empty(0), persistent=False)
+        # Start with a lightweight initial cache instead of max_seq_len
+        self._build_cache(2048)
 
     def _build_cache(self, seq_len: int):
         t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
@@ -30,8 +38,9 @@ class FocusRoPE(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
     def forward(self, x: torch.Tensor, seq_len: int, offset: int = 0) -> torch.Tensor:
-        if offset + seq_len > self.cos_cached.shape[2]:
-            self._build_cache(offset + seq_len)
+        # Expand cache dynamically only when context exceeds current buffer
+        if self.cos_cached.numel() == 0 or (offset + seq_len > self.cos_cached.shape[2]):
+            self._build_cache(max(offset + seq_len, 2048))
         cos = self.cos_cached[:, :, offset : offset + seq_len, :].to(x.dtype)
         sin = self.sin_cached[:, :, offset : offset + seq_len, :].to(x.dtype)
         return (x * cos) + (self._rotate_half(x) * sin)
@@ -66,7 +75,6 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
             v_c = v[:, :, start:end]
 
             P_c = scale * torch.matmul(q_c.unsqueeze(-1), k_c.unsqueeze(-2))
-
             power = torch.arange(1, curr_len + 1, device=q.device).view(1, 1, curr_len, 1, 1)
             carry_decay = (gamma ** power) * curr_state.unsqueeze(2)
 
