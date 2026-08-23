@@ -15,7 +15,8 @@ class CurriculumTrainer:
     Manages progressive context growth (128 -> 512 -> 2048 -> 8192 -> 65536 / 262144) with:
     - 1-Hour Wall-Clock Session Timer with graceful shutdown.
     - Dynamic Optimizer Switching: Adafactor (Stages 1-3) -> Muon (Stages 4-5).
-    - Dataset State Tracking (Samples seen & token buffers) for seamless resume.
+    - Dataset State Tracking (samples seen & token buffers) for seamless resume.
+    - Pure FP16 and AMP Mixed Precision compatibility without GradScaler conflicts.
     - Sentence-by-sentence / micro-batch weight updates and gradient accumulation.
     """
     def __init__(
@@ -45,12 +46,19 @@ class CurriculumTrainer:
         self.optimizer: Optional[torch.optim.Optimizer] = optimizer
         self.scheduler: Optional[Any] = scheduler
 
-        # Configure Mixed Precision (AMP)
+        # Detect if model parameters are already in Half Precision (FP16 / BF16)
+        is_half_model = any(p.dtype in {torch.float16, torch.bfloat16} for p in self.model.parameters())
+
         self.use_amp = False
         self.amp_dtype = torch.float32
         self.scaler = None
 
-        if self.device.type == "cuda":
+        if is_half_model:
+            # Model weights are already float16/bfloat16:
+            # GradScaler is not required (and will fail if called on float16 gradients)
+            self.use_amp = False
+            self.scaler = None
+        elif self.device.type == "cuda":
             if mixed_precision == "auto":
                 if torch.cuda.is_bf16_supported():
                     self.use_amp = True
@@ -79,7 +87,6 @@ class CurriculumTrainer:
         - Stages 1 to 3 (Index 0, 1, 2) -> Adafactor (low memory, factorized 2nd moments)
         - Stages 4 to 5 (Index >= 3)    -> Muon (Newton-Schulz polar matrix orthogonalization)
         """
-        # Determine target optimizer from stage name/dict or fallback to stage index rule
         target_opt = stage.get("optimizer", "adafactor" if stage_idx < 3 else "muon").lower()
         stage_lr = float(stage["lr"])
         total_steps = self.stages[-1]["max_steps"]
@@ -225,7 +232,7 @@ class CurriculumTrainer:
             latest_loss = accum_loss
             step += 1
 
-            # Update progress bar
+            # Update progress bar telemetry
             current_lr = self.optimizer.param_groups[0]["lr"]
             postfix = {
                 "loss": f"{accum_loss:.4f}",
@@ -236,7 +243,9 @@ class CurriculumTrainer:
             if self.session_duration_sec is not None:
                 remaining_min = max(0.0, (self.session_duration_sec - (time.time() - start_time)) / 60.0)
                 postfix["rem_time"] = f"{remaining_min:.1f}m"
-            if hasattr(self.streamer, "samples_seen"):
+            if hasattr(self.streamer, "samples_seen_in_current_ds"):
+                postfix["seen"] = f"{self.streamer.samples_seen_in_current_ds:,}"
+            elif hasattr(self.streamer, "samples_seen"):
                 postfix["seen"] = f"{self.streamer.samples_seen:,}"
 
             pbar.update(1)
