@@ -1,0 +1,95 @@
+# ==============================================================================
+# Mock-D1 (1.7B) Progressive Curriculum — Kaggle (2x T4 GPUs, 11-Hour Timer)
+# ==============================================================================
+
+model:
+  model_name: "Mock-D1-1.7B"
+  vocab_size: 128256
+  max_seq_len: 65536
+  hidden_dim: 1536
+  kqv_dim: 2304
+  intermediate_dim: 6144
+  num_layers: 36
+  num_blocks: 9
+  focus_layers_per_block: 3
+  retention_layers_per_block: 1
+  focus_heads: 18
+  use_rope: true
+  rope_base: 500000.0
+  use_focus_decay: true
+  retention_heads: 1
+  retention_latent_dim: 256
+  phi_act: "silu"
+  tie_word_embeddings: true
+  use_lora_deembed: true
+  lora_deembed_rank: 128
+  chunk_size: 512
+  use_chunked_scan: true
+  rms_norm_eps: 1.0e-6
+  initializer_range: 0.02
+  dropout: 0.0
+
+curriculum:
+  stages:
+    - name: "Stage 1 (128)  [Adafactor]"
+      seq_len: 128
+      batch_size: 8                    # 8 per GPU x 2 GPUs = 16 micro-batch
+      gradient_accumulation_steps: 2   # Effective batch: 4,096 tokens/step
+      optimizer: "adafactor"
+      lr: 1.0e-3
+      max_steps: 10000
+
+    - name: "Stage 2 (512)  [Adafactor]"
+      seq_len: 512
+      batch_size: 4                    # 4 per GPU x 2 GPUs = 8 micro-batch
+      gradient_accumulation_steps: 2   # Effective batch: 8,192 tokens/step
+      optimizer: "adafactor"
+      lr: 8.0e-4
+      max_steps: 25000
+
+    - name: "Stage 3 (2048) [Adafactor]"
+      seq_len: 2048
+      batch_size: 2                    # 2 per GPU x 2 GPUs = 4 micro-batch
+      gradient_accumulation_steps: 2   # Effective batch: 16,384 tokens/step
+      optimizer: "adafactor"
+      lr: 5.0e-4
+      max_steps: 50000
+
+    - name: "Stage 4 (4096) [Muon]"
+      seq_len: 4096
+      batch_size: 1                    # 1 per GPU x 2 GPUs = 2 micro-batch
+      gradient_accumulation_steps: 4   # Effective batch: 32,768 tokens/step
+      optimizer: "muon"
+      lr: 2.0e-2
+      max_steps: 75000
+
+    - name: "Stage 5 (65k)  [Muon]"
+      seq_len: 65536
+      batch_size: 1
+      gradient_accumulation_steps: 1
+      optimizer: "muon"
+      lr: 1.0e-2
+      max_steps: 100000
+
+training:
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+  warmup_steps: 500
+  min_lr_ratio: 0.1
+  save_every: 500
+  session_duration_minutes: 660.0      # 11 hours continuous runtime
+  keep_last_n_checkpoints: 2
+  output_dir: "/kaggle/working/mock_d1_weights"
+
+data:
+  tokenizer_name: "HuggingFaceTB/SmolLM3-3B"
+  buffer_size: 25000                   # Expanded for Kaggle's 30 GB CPU RAM
+  split: "train"
+  seed: 42
+  datasets:
+    - name: "roneneldan/TinyStories"
+      config: null
+    - name: "HuggingFaceTB/smollm-corpus"
+      config: "cosmopedia-v2"
