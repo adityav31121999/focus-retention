@@ -1,28 +1,39 @@
 # ==============================================================================
-# Mock-D1 (1.7B) Progressive Curriculum — Kaggle (2x T4 GPUs, 11-Hour Timer)
+# Mock-D1 (1.7B) Progressive Curriculum — Kaggle (2x T4 DDP, Rescaled Steps)
+# Total Training Budget: ~65 Hours across 10,000 steps (~150+ Million Tokens)
 # ==============================================================================
 
 model:
   model_name: "Mock-D1-1.7B"
-  vocab_size: 128256
-  max_seq_len: 65536
-  hidden_dim: 1536
-  kqv_dim: 2304
-  intermediate_dim: 6144
+  vocab_size: 128256                   # SmolLM3 Tokenizer Vocab (128k)
+  max_seq_len: 65536                   # Architectural Context Limit (64k)
+  hidden_dim: 1536                     # D_E
+  kqv_dim: 2304                        # D_KQV (18 heads * 128 head_dim)
+  intermediate_dim: 6144               # D_FFN (SwiGLU)
+  
+  # Block & Layer Topology (9 Blocks * (3 Focus + 1 Retention) = 36 Layers)
   num_layers: 36
   num_blocks: 9
-  focus_layers_per_block: 3
-  retention_layers_per_block: 1
-  focus_heads: 18
+  focus_layers_per_block: 3            # 27 Focus layers total
+  retention_layers_per_block: 1        # 9 Retention layers total
+  
+  # Focus Attention
+  focus_heads: 18                      # N_H = 18 (d_h = 128)
   use_rope: true
   rope_base: 500000.0
   use_focus_decay: true
+  
+  # Global Retention Mechanism (Latent KV)
   retention_heads: 1
-  retention_latent_dim: 256
+  retention_latent_dim: 256            # d_L (Latent KV-cache dimension)
   phi_act: "silu"
+  
+  # Embeddings & LoRA De-Embedding Head
   tie_word_embeddings: true
   use_lora_deembed: true
-  lora_deembed_rank: 128
+  lora_deembed_rank: 128               # r = 128
+  
+  # Scan & Regularization
   chunk_size: 512
   use_chunked_scan: true
   rms_norm_eps: 1.0e-6
@@ -31,61 +42,81 @@ model:
 
 curriculum:
   stages:
+    # --------------------------------------------------------------------------
+    # Stage 1: Basic Word Syntax & Short Grammar (128 Context)
+    # 2,000 steps x 4,096 tokens = 8.19 Million tokens (~15 Hours)
+    # --------------------------------------------------------------------------
     - name: "Stage 1 (128)  [Adafactor]"
       seq_len: 128
-      batch_size: 8                    # 8 per GPU x 2 GPUs = 16 micro-batch
-      gradient_accumulation_steps: 2   # Effective batch: 4,096 tokens/step
+      batch_size: 2                    # 2 per GPU x 2 GPUs = 4 per micro-step
+      gradient_accumulation_steps: 8   # 4,096 tokens per step (144 MB peak tensor)
       optimizer: "adafactor"
       lr: 1.0e-3
-      max_steps: 10000
+      max_steps: 2000
 
+    # --------------------------------------------------------------------------
+    # Stage 2: Paragraph Coherence (512 Context)
+    # +2,000 steps x 8,192 tokens = 16.38 Million tokens (~15 Hours)
+    # --------------------------------------------------------------------------
     - name: "Stage 2 (512)  [Adafactor]"
       seq_len: 512
-      batch_size: 4                    # 4 per GPU x 2 GPUs = 8 micro-batch
-      gradient_accumulation_steps: 2   # Effective batch: 8,192 tokens/step
+      batch_size: 2                    # 2 per GPU x 2 GPUs = 4 per micro-step
+      gradient_accumulation_steps: 4   # 8,192 tokens per step
       optimizer: "adafactor"
       lr: 8.0e-4
-      max_steps: 25000
+      max_steps: 4000
 
+    # --------------------------------------------------------------------------
+    # Stage 3: Multi-Paragraph Reasoning (2,048 Context)
+    # +2,000 steps x 16,384 tokens = 32.76 Million tokens (~15 Hours)
+    # --------------------------------------------------------------------------
     - name: "Stage 3 (2048) [Adafactor]"
       seq_len: 2048
-      batch_size: 2                    # 2 per GPU x 2 GPUs = 4 micro-batch
-      gradient_accumulation_steps: 2   # Effective batch: 16,384 tokens/step
+      batch_size: 1                    # 1 per GPU x 2 GPUs = 2 per micro-step
+      gradient_accumulation_steps: 4   # 16,384 tokens per step
       optimizer: "adafactor"
       lr: 5.0e-4
-      max_steps: 50000
+      max_steps: 6000
 
+    # --------------------------------------------------------------------------
+    # Stage 4: Long Document Attention [Muon Optimizer] (4,096 Context)
+    # +2,000 steps x 32,768 tokens = 65.53 Million tokens (~12 Hours)
+    # --------------------------------------------------------------------------
     - name: "Stage 4 (4096) [Muon]"
       seq_len: 4096
-      batch_size: 1                    # 1 per GPU x 2 GPUs = 2 micro-batch
-      gradient_accumulation_steps: 4   # Effective batch: 32,768 tokens/step
+      batch_size: 1                    # 1 per GPU x 2 GPUs = 2 per micro-step
+      gradient_accumulation_steps: 4   # 32,768 tokens per step
       optimizer: "muon"
       lr: 2.0e-2
-      max_steps: 75000
+      max_steps: 8000
 
+    # --------------------------------------------------------------------------
+    # Stage 5: Full Architectural Context Stabilization (65k Context)
+    # +2,000 steps x 131,072 tokens = 262.14 Million tokens (~12 Hours)
+    # --------------------------------------------------------------------------
     - name: "Stage 5 (65k)  [Muon]"
       seq_len: 65536
-      batch_size: 1
-      gradient_accumulation_steps: 1
+      batch_size: 1                    # Chunked scan parallel mode
+      gradient_accumulation_steps: 1   # 131,072 tokens per step
       optimizer: "muon"
       lr: 1.0e-2
-      max_steps: 100000
+      max_steps: 10000
 
 training:
   weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
   max_grad_norm: 1.0
-  warmup_steps: 500
+  warmup_steps: 300                     # Proportional warmup for 10k total steps
   min_lr_ratio: 0.1
-  save_every: 500
+  save_every: 250                      # Save checkpoint every 250 steps (~1.8 hours)
   session_duration_minutes: 660.0      # 11 hours continuous runtime
-  keep_last_n_checkpoints: 2
+  keep_last_n_checkpoints: 2           # Keeps only 2 files (~6.8 GB) to protect disk quota
   output_dir: "/kaggle/working/mock_d1_weights"
 
 data:
-  tokenizer_name: "HuggingFaceTB/SmolLM3-3B"
-  buffer_size: 25000                   # Expanded for Kaggle's 30 GB CPU RAM
+  tokenizer_name: "HuggingFaceTB/SmolLM3-3B"   # 128,256 Vocab Tokenizer
+  buffer_size: 25000                   # 25k shuffle buffer for 30 GB CPU RAM
   split: "train"
   seed: 42
   datasets:

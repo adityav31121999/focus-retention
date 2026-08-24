@@ -10,7 +10,7 @@ from .configure_mockd1_mini import MockD1Config
 class FocusRoPE(nn.Module):
     """
     Dynamic on-demand Rotary Positional Embeddings.
-    Allocates an initial lightweight cache (~2k tokens) and dynamically grows,
+    Allocates an initial lightweight cache (2,048 tokens) and dynamically grows,
     preventing multi-gigabyte static VRAM allocation during model initialization.
     """
     def __init__(self, dim: int, max_seq_len: int = 262144, base: float = 500000.0):
@@ -22,7 +22,7 @@ class FocusRoPE(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("cos_cached", torch.empty(0), persistent=False)
         self.register_buffer("sin_cached", torch.empty(0), persistent=False)
-        # Start with a lightweight initial cache instead of max_seq_len
+        # Start with a lightweight 2048-token cache
         self._build_cache(2048)
 
     def _build_cache(self, seq_len: int):
@@ -145,6 +145,9 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
             sum_grad_S = torch.sum(grad_S_c * S_c, dim=-1, keepdim=True)
             grad_M_c = S_c * (grad_S_c - sum_grad_S)
 
+            # Free temporary Jacobian buffers immediately
+            del grad_S_c, sum_grad_S
+
             grad_M_c[:, :, -1] += curr_grad_carry
 
             grad_P_c = torch.zeros_like(grad_M_c)
@@ -155,6 +158,8 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
                 grad_P_c[:, :, t] = curr_grad_P
                 prev_M = start_state if t == 0 else M_c[:, :, t - 1]
                 grad_gamma += torch.sum(curr_grad_P * prev_M, dim=(0, 2, 3), keepdim=True)
+
+            del grad_M_c
 
             curr_grad_carry = curr_grad_P * gamma
 
@@ -210,6 +215,9 @@ class FocusAttentionFunction(torch.autograd.Function):
         sum_grad_S = torch.sum(grad_S * S, dim=-1, keepdim=True)
         grad_M = S * (grad_S - sum_grad_S)
 
+        # Free temporary Jacobian buffers immediately
+        del grad_S, sum_grad_S
+
         grad_P = torch.zeros_like(grad_M)
         curr_grad_P = torch.zeros(B, H, d_h, d_h, device=q.device, dtype=dtype)
         grad_gamma = torch.zeros_like(gamma)
@@ -219,6 +227,8 @@ class FocusAttentionFunction(torch.autograd.Function):
             grad_P[:, :, t] = curr_grad_P
             if t > 0:
                 grad_gamma += torch.sum(curr_grad_P * M[:, :, t - 1], dim=(0, 2, 3), keepdim=True)
+
+        del grad_M
 
         grad_Q = scale * torch.matmul(k.unsqueeze(-2), grad_P.transpose(-1, -2)).squeeze(-2)
         grad_K = scale * torch.matmul(q.unsqueeze(-2), grad_P).squeeze(-2)
