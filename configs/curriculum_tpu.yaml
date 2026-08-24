@@ -1,6 +1,6 @@
 # ==============================================================================
-# Mock-D1 (1.7B) Progressive Curriculum — Google Colab (1x T4 / P100 GPU)
-# Budget: 55-Minute Sessions with Direct Google Drive Backup
+# Mock-D1 (1.7B) Progressive Curriculum — TPU v5e-8 (8 Cores, 128 GB HBM)
+# Budget: ~4.5 Hours total across 10,000 steps (~300+ Million Tokens)
 # ==============================================================================
 
 model:
@@ -32,61 +32,66 @@ model:
 
 curriculum:
   stages:
+    # Stage 1: 8 cores x 8 batch x 128 seq = 8,192 tokens/step (~45 mins)
     - name: "Stage 1 (128)  [Adafactor]"
       seq_len: 128
-      batch_size: 1
+      batch_size: 8
       gradient_accumulation_steps: 1
       optimizer: "adafactor"
       lr: 1.0e-3
-      max_steps: 10000
+      max_steps: 2000
 
+    # Stage 2: 8 cores x 4 batch x 512 seq = 16,384 tokens/step (~45 mins)
     - name: "Stage 2 (512)  [Adafactor]"
       seq_len: 512
-      batch_size: 1
+      batch_size: 4
       gradient_accumulation_steps: 1
       optimizer: "adafactor"
       lr: 8.0e-4
-      max_steps: 25000
+      max_steps: 4000
 
+    # Stage 3: 8 cores x 2 batch x 2048 seq = 32,768 tokens/step (~60 mins)
     - name: "Stage 3 (2048) [Adafactor]"
       seq_len: 2048
-      batch_size: 1
+      batch_size: 2
       gradient_accumulation_steps: 1
       optimizer: "adafactor"
       lr: 5.0e-4
-      max_steps: 50000
+      max_steps: 6000
 
+    # Stage 4: 8 cores x 1 batch x 4096 seq x 2 accum = 65,536 tokens/step (~60 mins)
     - name: "Stage 4 (4096) [Muon]"
       seq_len: 4096
       batch_size: 1
-      gradient_accumulation_steps: 1
+      gradient_accumulation_steps: 2
       optimizer: "muon"
       lr: 2.0e-2
-      max_steps: 75000
+      max_steps: 8000
 
-    - name: "Stage 5 (4096) [Muon]"
-      seq_len: 4096
+    # Stage 5: Full 65k Parallel Chunked Scan Mode (~60 mins)
+    - name: "Stage 5 (65k)  [Muon]"
+      seq_len: 65536
       batch_size: 1
       gradient_accumulation_steps: 1
       optimizer: "muon"
       lr: 1.0e-2
-      max_steps: 100000
+      max_steps: 10000
 
 training:
   weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
   max_grad_norm: 1.0
-  warmup_steps: 500
+  warmup_steps: 300
   min_lr_ratio: 0.1
-  save_every: 500
-  session_duration_minutes: 55.0       # Auto-saves at 55 minutes for Colab safety
+  save_every: 250
+  session_duration_minutes: 660.0
   keep_last_n_checkpoints: 2
-  output_dir: "/content/drive/MyDrive/mock_d1_weights"
+  output_dir: "./mock_d1_weights"
 
 data:
   tokenizer_name: "HuggingFaceTB/SmolLM3-3B"
-  buffer_size: 10000                   # Safe for Colab's 12.7 GB CPU RAM limit
+  buffer_size: 30000
   split: "train"
   seed: 42
   datasets:
