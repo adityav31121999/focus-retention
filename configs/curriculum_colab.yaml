@@ -79,8 +79,8 @@ training:
   max_grad_norm: 1.0
   warmup_steps: 500
   min_lr_ratio: 0.1
-  save_every: 500
-  session_duration_minutes: 55.0       # Auto-saves at 55 minutes for Colab safety
+  save_every: 250
+  session_duration_minutes: 60.0       # Auto-saves at 55 minutes for Colab safety
   keep_last_n_checkpoints: 2
   output_dir: "/content/drive/MyDrive/mock_d1_weights"
 

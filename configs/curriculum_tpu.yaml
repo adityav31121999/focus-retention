@@ -84,8 +84,8 @@ training:
   max_grad_norm: 1.0
   warmup_steps: 300
   min_lr_ratio: 0.1
-  save_every: 250
-  session_duration_minutes: 660.0
+  save_every: 100
+  session_duration_minutes: 60.0
   keep_last_n_checkpoints: 2
   output_dir: "./mock_d1_weights"
 
