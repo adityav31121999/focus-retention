@@ -109,8 +109,8 @@ training:
   max_grad_norm: 1.0
   warmup_steps: 300                     # Proportional warmup for 10k total steps
   min_lr_ratio: 0.1
-  save_every: 250                      # Save checkpoint every 250 steps (~1.8 hours)
-  session_duration_minutes: 660.0      # 11 hours continuous runtime
+  save_every: 100                      # Save checkpoint every 100 steps (~38-40 minutes)
+  session_duration_minutes: 200.0      # 2 hours continuous runtime
   keep_last_n_checkpoints: 2           # Keeps only 2 files (~6.8 GB) to protect disk quota
   output_dir: "/kaggle/working/mock_d1_weights"
 
