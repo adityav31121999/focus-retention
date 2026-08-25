@@ -1,12 +1,12 @@
 # ==============================================================================
 # Mock-D1 (1.7B) Progressive Curriculum — Kaggle (Dual T4 DDP / 2x GPUs)
-# Budget: ~65 Hours across 10,000 steps (~150+ Million Tokens)
+# Budget: Multi-Session Execution across 10,000 steps
 # ==============================================================================
 
 model:
   model_name: "Mock-D1-1.7B"
   vocab_size: 128256                   # SmolLM3 Tokenizer Vocab (128k)
-  max_seq_len: 65536                   # Architectural Context Limit (64k)
+  max_seq_len: 16384                   # Practical max context for 15GB VRAM
   hidden_dim: 1536                     # D_E
   kqv_dim: 2304                        # D_KQV (18 heads * 128 head_dim)
   intermediate_dim: 6144               # D_FFN (SwiGLU)
@@ -43,41 +43,41 @@ model:
 curriculum:
   stages:
     # Stage 1: Basic Word Syntax & Grammar (128 Context)
-    # 2,000 steps x 4,096 tokens = 8.19 Million tokens (~15 Hours)
+    # Batch per step: 2 * 2 GPUs * 8 grad_accum = 32 batches = 4,096 tokens/step
     - name: "Stage 1 (128)  [Adafactor]"
       seq_len: 128
-      batch_size: 2                    # 2 per GPU x 2 GPUs = 4 per micro-step
-      gradient_accumulation_steps: 8   # 4,096 tokens per step
+      batch_size: 2
+      gradient_accumulation_steps: 8
       optimizer: "adafactor"
       lr: 1.0e-3
       max_steps: 2000
 
     # Stage 2: Paragraph Coherence (512 Context)
-    # +2,000 steps x 8,192 tokens = 16.38 Million tokens (~15 Hours)
+    # Batch per step: 2 * 2 GPUs * 4 grad_accum = 16 batches = 8,192 tokens/step
     - name: "Stage 2 (512)  [Adafactor]"
       seq_len: 512
-      batch_size: 2                    # 2 per GPU x 2 GPUs = 4 per micro-step
-      gradient_accumulation_steps: 4   # 8,192 tokens per step
+      batch_size: 2
+      gradient_accumulation_steps: 4
       optimizer: "adafactor"
       lr: 8.0e-4
       max_steps: 4000
 
     # Stage 3: Multi-Paragraph Reasoning (2,048 Context)
-    # +2,000 steps x 16,384 tokens = 32.76 Million tokens (~15 Hours)
+    # Batch per step: 1 * 2 GPUs * 4 grad_accum = 8 batches = 16,384 tokens/step
     - name: "Stage 3 (2048) [Adafactor]"
       seq_len: 2048
-      batch_size: 1                    # 1 per GPU x 2 GPUs = 2 per micro-step
-      gradient_accumulation_steps: 4   # 16,384 tokens per step
+      batch_size: 1
+      gradient_accumulation_steps: 4
       optimizer: "adafactor"
       lr: 5.0e-4
       max_steps: 6000
 
     # Stage 4: Long Document Attention [Muon Optimizer] (4,096 Context)
-    # +2,000 steps x 32,768 tokens = 65.53 Million tokens (~12 Hours)
+    # Batch per step: 1 * 2 GPUs * 4 grad_accum = 8 batches = 32,768 tokens/step
     - name: "Stage 4 (4096) [Muon]"
       seq_len: 4096
-      batch_size: 1                    # 1 per GPU x 2 GPUs = 2 per micro-step
-      gradient_accumulation_steps: 4   # 32,768 tokens per step
+      batch_size: 1
+      gradient_accumulation_steps: 4
       optimizer: "muon"
       lr: 2.0e-2
       max_steps: 8000
@@ -100,13 +100,13 @@ training:
   warmup_steps: 300
   min_lr_ratio: 0.1
   save_every: 100
-  session_duration_minutes: 60.0      # 1.5 hours continuous runtime
-  keep_last_n_checkpoints: 2
+  session_duration_minutes: 60.0
+  keep_last_n_checkpoints: 3
   output_dir: "/kaggle/working/mock_d1_weights"
 
 data:
   tokenizer_name: "HuggingFaceTB/SmolLM3-3B"
-  buffer_size: 25000                   # Expanded for Kaggle's 30 GB CPU RAM
+  buffer_size: 25000
   split: "train"
   seed: 42
   datasets:
