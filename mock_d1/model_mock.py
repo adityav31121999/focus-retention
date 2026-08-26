@@ -94,6 +94,9 @@ class MockD1Model(nn.Module):
         h = x0
         new_states = [] if past_states is not None else None
 
+        # Detect device type to handle checkpointing compatibility
+        is_xla = input_ids.device.type == "xla"
+
         for i, block in enumerate(self.blocks):
             block_states = past_states[i] if past_states is not None else None
 
@@ -104,12 +107,23 @@ class MockD1Model(nn.Module):
                         return out
                     return custom_forward
 
-                h = checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    h,
-                    x0,
-                    use_reentrant=False
-                )
+                if is_xla:
+                    # XLA requires use_reentrant=True and preserve_rng_state=False
+                    h = checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        h,
+                        x0,
+                        use_reentrant=True,
+                        preserve_rng_state=False
+                    )
+                else:
+                    # Standard non-reentrant checkpointing for CUDA/ROCm
+                    h = checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        h,
+                        x0,
+                        use_reentrant=False
+                    )
             else:
                 h, next_block_states = block(h, x0=x0, states=block_states, seq_offset=seq_offset)
                 if new_states is not None:
