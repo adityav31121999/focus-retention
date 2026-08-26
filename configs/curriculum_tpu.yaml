@@ -1,30 +1,41 @@
 # ==============================================================================
-# Mock-D1 (1.7B) Progressive Curriculum — TPU v5e-8 (8 Cores, 128 GB HBM)
-# Budget: ~4.5 Hours total across 10,000 steps (~300+ Million Tokens)
+# Mock-D1 (1.7B) Progressive Curriculum — TPU v5e-8 (8 Cores, 128 GB HBM, 330 GB RAM)
+# Tuned for Maximum MXU Matrix Utilization & Token Throughput
+# Budget: ~2.5 to 3.5 Hours across 10,000 steps (~600+ Million Tokens)
 # ==============================================================================
 
 model:
   model_name: "Mock-D1-1.7B"
-  vocab_size: 128256
-  max_seq_len: 65536
-  hidden_dim: 1536
-  kqv_dim: 2304
-  intermediate_dim: 6144
+  vocab_size: 128256                   # SmolLM3 Tokenizer Vocab (128k)
+  max_seq_len: 65536                   # Architectural context window limit
+  hidden_dim: 1536                     # D_E
+  kqv_dim: 2304                        # D_KQV (18 heads * 128 head_dim)
+  intermediate_dim: 6144               # D_FFN (SwiGLU)
+  
+  # Block & Layer Topology (9 Blocks * (3 Focus + 1 Retention) = 36 Layers)
   num_layers: 36
   num_blocks: 9
-  focus_layers_per_block: 3
-  retention_layers_per_block: 1
-  focus_heads: 18
+  focus_layers_per_block: 3            # 27 Focus layers total
+  retention_layers_per_block: 1        # 9 Retention layers total
+  
+  # Focus Attention
+  focus_heads: 18                      # N_H = 18 (d_h = 128: ideal for TPU systolic tiles)
   use_rope: true
   rope_base: 500000.0
   use_focus_decay: true
+  
+  # Global Retention Mechanism (Latent KV)
   retention_heads: 1
-  retention_latent_dim: 256
+  retention_latent_dim: 256            # d_L (Latent KV-cache dimension)
   phi_act: "silu"
+  
+  # Embeddings & LoRA De-Embedding Head
   tie_word_embeddings: true
   use_lora_deembed: true
-  lora_deembed_rank: 128
-  chunk_size: 512
+  lora_deembed_rank: 128               # r = 128
+  
+  # Scan & Regularization
+  chunk_size: 512                      # Matches TPU tile dimension
   use_chunked_scan: true
   rms_norm_eps: 1.0e-6
   initializer_range: 0.02
@@ -32,43 +43,48 @@ model:
 
 curriculum:
   stages:
-    # Stage 1: 8 cores x 8 batch x 128 seq = 8,192 tokens/step (~45 mins)
+    # Stage 1: Basic Word Syntax & Grammar (128 Context)
+    # 8 cores x 32 batch x 128 seq = 32,768 tokens/step (~25 mins)
     - name: "Stage 1 (128)  [Adafactor]"
       seq_len: 128
-      batch_size: 8
+      batch_size: 32                   # Fully saturates 8x TPU MXU tiles
+      gradient_accumulation_steps: 1   # Zero loop overhead
+      optimizer: "adafactor"
+      lr: 1.2e-3
+      max_steps: 2000
+
+    # Stage 2: Paragraph Coherence (512 Context)
+    # 8 cores x 16 batch x 512 seq = 65,536 tokens/step (~35 mins)
+    - name: "Stage 2 (512)  [Adafactor]"
+      seq_len: 512
+      batch_size: 16
       gradient_accumulation_steps: 1
       optimizer: "adafactor"
       lr: 1.0e-3
-      max_steps: 2000
-
-    # Stage 2: 8 cores x 4 batch x 512 seq = 16,384 tokens/step (~45 mins)
-    - name: "Stage 2 (512)  [Adafactor]"
-      seq_len: 512
-      batch_size: 4
-      gradient_accumulation_steps: 1
-      optimizer: "adafactor"
-      lr: 8.0e-4
       max_steps: 4000
 
-    # Stage 3: 8 cores x 2 batch x 2048 seq = 32,768 tokens/step (~60 mins)
+    # Stage 3: Multi-Paragraph Reasoning (2,048 Context)
+    # 8 cores x 8 batch x 2048 seq = 131,072 tokens/step (~45 mins)
     - name: "Stage 3 (2048) [Adafactor]"
       seq_len: 2048
-      batch_size: 2
+      batch_size: 8
       gradient_accumulation_steps: 1
       optimizer: "adafactor"
-      lr: 5.0e-4
+      lr: 6.0e-4
       max_steps: 6000
 
-    # Stage 4: 8 cores x 1 batch x 4096 seq x 2 accum = 65,536 tokens/step (~60 mins)
+    # Stage 4: Long Document Attention [Muon Optimizer] (4,096 Context)
+    # 8 cores x 4 batch x 4096 seq = 131,072 tokens/step (~45 mins)
     - name: "Stage 4 (4096) [Muon]"
       seq_len: 4096
-      batch_size: 1
-      gradient_accumulation_steps: 2
+      batch_size: 4
+      gradient_accumulation_steps: 1
       optimizer: "muon"
       lr: 2.0e-2
       max_steps: 8000
 
-    # Stage 5: Full 65k Parallel Chunked Scan Mode (~60 mins)
+    # Stage 5: Full 65k Parallel Chunked Scan Mode (65,536 Context)
+    # 8 cores x 1 batch x 65536 seq = 524,288 tokens/step (~50 mins)
     - name: "Stage 5 (65k)  [Muon]"
       seq_len: 65536
       batch_size: 1
@@ -85,13 +101,13 @@ training:
   warmup_steps: 300
   min_lr_ratio: 0.1
   save_every: 100
-  session_duration_minutes: 60.0
-  keep_last_n_checkpoints: 2
-  output_dir: "./mock_d1_weights"
+  session_duration_minutes: 60.0       # 1-hour chunk sessions
+  keep_last_n_checkpoints: 3
+  output_dir: "/kaggle/working/mock_d1_weights"
 
 data:
   tokenizer_name: "HuggingFaceTB/SmolLM3-3B"
-  buffer_size: 30000
+  buffer_size: 200000                  # Takes advantage of 330 GB Host RAM for fast caching
   split: "train"
   seed: 42
   datasets:

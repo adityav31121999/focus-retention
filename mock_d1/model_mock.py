@@ -84,17 +84,17 @@ class MockD1Model(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     def forward(
-        self,
-        input_ids: torch.LongTensor,
-        past_states: Optional[List[List[Optional[torch.Tensor]]]] = None,
-        seq_offset: int = 0
-    ) -> Tuple[torch.Tensor, Optional[List[List[Optional[torch.Tensor]]]]]:
+            self,
+            input_ids: torch.LongTensor,
+            past_states: Optional[List[List[Optional[torch.Tensor]]]] = None,
+            seq_offset: int = 0
+        ) -> Tuple[torch.Tensor, Optional[List[List[Optional[torch.Tensor]]]]]:
         
         x0 = self.embed_tokens(input_ids)
         h = x0
         new_states = [] if past_states is not None else None
 
-        # Detect device type to handle checkpointing compatibility
+        # Check once if running on TPU / XLA device
         is_xla = input_ids.device.type == "xla"
 
         for i, block in enumerate(self.blocks):
@@ -107,8 +107,9 @@ class MockD1Model(nn.Module):
                         return out
                     return custom_forward
 
+                # --- Device-Specific Safe Activation Checkpointing ---
                 if is_xla:
-                    # XLA requires use_reentrant=True and preserve_rng_state=False
+                    # TPU / XLA: Must use reentrant mode and disable RNG state preservation
                     h = checkpoint.checkpoint(
                         create_custom_forward(block),
                         h,
@@ -117,7 +118,7 @@ class MockD1Model(nn.Module):
                         preserve_rng_state=False
                     )
                 else:
-                    # Standard non-reentrant checkpointing for CUDA/ROCm
+                    # CUDA GPU / ROCm / CPU: Modern non-reentrant checkpointing
                     h = checkpoint.checkpoint(
                         create_custom_forward(block),
                         h,
