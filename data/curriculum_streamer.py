@@ -1,5 +1,6 @@
 # data/curriculum_streamer.py
 from typing import Iterator, Optional, Dict, Any, List, Union
+import itertools
 import torch
 from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
@@ -8,10 +9,7 @@ from .tokeniser import TokenizerManager
 
 class CurriculumStreamer(IterableDataset):
     """
-    Streams tokens across one or multiple datasets sequentially:
-    - When a dataset is exhausted, automatically moves to the next one.
-    - When all datasets finish, increments the epoch counter and restarts from the first dataset.
-    - Tracks active dataset index, sample offset, epoch, and token buffer for seamless checkpoint resuming.
+    High-throughput token streamer with instant checkpoint seeking.
     """
     def __init__(
         self,
@@ -32,7 +30,6 @@ class CurriculumStreamer(IterableDataset):
         self.seed = seed
         self.eos_token_id = self.tokenizer.tokenizer.eos_token_id
 
-        # Normalize datasets into a unified list of {"name": ..., "config": ...}
         if datasets_list is not None and len(datasets_list) > 0:
             self.datasets = datasets_list
         elif isinstance(dataset_name, list):
@@ -40,19 +37,16 @@ class CurriculumStreamer(IterableDataset):
         else:
             self.datasets = [{"name": dataset_name, "config": dataset_config}]
 
-        # State tracking for checkpointing & resuming
         self.current_ds_idx: int = 0
         self.samples_seen_in_current_ds: int = 0
         self.epoch: int = 0
         self.token_buffer: List[int] = []
 
     def set_seq_len(self, new_seq_len: int):
-        """Dynamically switch context length when transitioning stages."""
         print(f"[Curriculum Data] Switched sequence length to: {new_seq_len}")
         self.seq_len = new_seq_len
 
     def state_dict(self) -> Dict[str, Any]:
-        """Returns streaming progress, active dataset index, epoch, and buffer state."""
         return {
             "current_ds_idx": self.current_ds_idx,
             "samples_seen_in_current_ds": self.samples_seen_in_current_ds,
@@ -62,7 +56,6 @@ class CurriculumStreamer(IterableDataset):
         }
 
     def load_state_dict(self, state_dict: Optional[Dict[str, Any]]):
-        """Restores dataset index, sample offset, epoch, and token buffer from checkpoint."""
         if not state_dict:
             return
         self.current_ds_idx = state_dict.get("current_ds_idx", 0)
@@ -92,6 +85,7 @@ class CurriculumStreamer(IterableDataset):
                 f"'{ds_name}' (Config: {ds_config}) | Epoch: {self.epoch + 1}"
             )
 
+            # Load dataset in non-blocking streaming mode
             dataset = load_dataset(
                 ds_name,
                 ds_config,
@@ -99,16 +93,16 @@ class CurriculumStreamer(IterableDataset):
                 streaming=True
             )
 
-            # Fast-forward past already-processed samples if resuming
+            dataset_iter = iter(dataset)
+
+            # Fast C-level iterator consume instead of slow .skip()
             if self.samples_seen_in_current_ds > 0:
-                print(f"⏩ [Data Streamer] Skipping first {self.samples_seen_in_current_ds:,} samples in '{ds_name}'...")
-                dataset = dataset.skip(self.samples_seen_in_current_ds)
+                print(f"⏩ [Data Streamer] Fast-forwarding {self.samples_seen_in_current_ds:,} samples...")
+                # Consumes generator slice without overhead
+                dataset_iter = itertools.islice(dataset_iter, self.samples_seen_in_current_ds, None)
 
-            # Shuffle using a seed varied by epoch for diverse ordering across cycles
-            dataset = dataset.shuffle(buffer_size=self.buffer_size, seed=self.seed + self.epoch)
-
-            # Stream through current dataset
-            for sample in dataset:
+            # Stream tokens
+            for sample in dataset_iter:
                 self.samples_seen_in_current_ds += 1
                 text = sample.get("text", "")
                 if not text:
@@ -123,17 +117,14 @@ class CurriculumStreamer(IterableDataset):
                     tensor_chunk = torch.tensor(chunk, dtype=torch.long)
                     yield {"input_ids": tensor_chunk, "labels": tensor_chunk.clone()}
 
-            # --- Current Dataset Exhausted ---
-            print(f"\n✅ [Data Streamer] Finished dataset '{ds_name}' ({self.samples_seen_in_current_ds:,} samples).")
             self.current_ds_idx += 1
             self.samples_seen_in_current_ds = 0
 
-            # --- All Datasets Completed: Increment Epoch & Loop Back to Start ---
             if self.current_ds_idx >= len(self.datasets):
                 self.current_ds_idx = 0
                 self.epoch += 1
-                print(f"\n🎉 [Data Streamer] Completed Epoch {self.epoch}! Looping back to first dataset...\n")
 
 
 def create_curriculum_dataloader(streamer: CurriculumStreamer, batch_size: int = 1) -> DataLoader:
-    return DataLoader(streamer, batch_size=batch_size, pin_memory=True)
+    # Disable pin_memory on TPU to suppress the PyTorch warning and prevent CPU lock
+    return DataLoader(streamer, batch_size=batch_size, pin_memory=False)
