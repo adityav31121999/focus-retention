@@ -285,20 +285,24 @@ def create_optimizer(
 # 5. Learning Rate Schedulers
 # ==============================================================================
 
-def get_cosine_schedule_with_warmup(
-    optimizer, 
+def get_cosine_schedule_with_warmup(optimizer,
     warmup_steps: int, 
-    max_steps: int, 
+    max_steps: int,
     min_lr_ratio: float = 0.1,
     last_epoch: int = -1
-):
-    """Cosine decay schedule with linear warmup."""
+    ):
+    """Cosine decay schedule with linear warmup supporting checkpoint resume."""
+    # Ensure initial_lr exists in each param group for PyTorch scheduler resume
+    for group in optimizer.param_groups:
+        if "initial_lr" not in group:
+            group["initial_lr"] = group["lr"]
+
     def lr_lambda(current_step: int):
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
         progress = float(current_step - warmup_steps) / float(max(1, max_steps - warmup_steps))
         return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
-    
+        
     return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
 
 
