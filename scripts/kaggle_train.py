@@ -1,8 +1,8 @@
 """
-scripts/train_accelerator.py
-============================
+scripts/kaggle_train.py
+======================================================
 Universal 10,000-Step Pretraining Runner for both TPU (v5e / v3-8) and GPU (Dual T4 DDP, P100, A100).
-Checkpoints saved every 500 steps to /kaggle/working/mock_d1_weights.
+Checkpoints saved every 500 steps to /kaggle/working/mock_d1_weights. (scripts/train_accelerator.py)
 
 Usage:
 ------
@@ -34,7 +34,6 @@ is_tpu = False
 try:
     import torch_xla
     import torch_xla.core.xla_model as xm
-    # Register xla device module for autograd / checkpointing
     if hasattr(torch, "_register_device_module"):
         try:
             torch._register_device_module("xla", torch_xla)
@@ -249,7 +248,7 @@ def main():
         muon_lr=stage_lr if stage_opt_type == "muon" else 0.02,
         weight_decay=0.01 if stage_opt_type == "adafactor" else 0.1
     )
-    warmup = cfg["training"].get("warmup_steps", 300)
+    warmup = cfg["training"].get("warmup_steps", 200)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         warmup_steps=warmup,
@@ -273,7 +272,14 @@ def main():
         print(f"   • Global Effective   : {eff_tokens:,} tokens / step")
         print("=" * 75 + "\n")
 
-    pbar = tqdm(total=total_steps, initial=start_step, desc="10k Curriculum Training") if local_rank == 0 else None
+    # Fixed: uses total_steps for pbar
+    pbar = tqdm(
+        total=total_steps, 
+        initial=start_step, 
+        desc="Train",
+        ncols=95
+    ) if local_rank == 0 else None
+
     step = start_step
     start_time = time.time()
     avg_loss = 0.0
@@ -303,7 +309,12 @@ def main():
                 muon_lr=stage_lr if stage_opt_type == "muon" else 0.02,
                 weight_decay=0.01 if stage_opt_type == "adafactor" else 0.1
             )
-            scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps=warmup, max_steps=total_steps)
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer, 
+                warmup_steps=warmup, 
+                max_steps=total_steps,
+                last_epoch=step - 1
+            )
 
             if local_rank == 0:
                 print(f"\n🚀 Transitioned to Stage {current_stage_idx + 1}: {current_stage['name']}")
@@ -359,7 +370,7 @@ def main():
             current_lr = optimizer.param_groups[0]["lr"]
             pbar.update(1)
             pbar.set_postfix({
-                "loss": f"{avg_loss:.4f}",
+                "loss": f"{avg_loss:.3f}",
                 "lr": f"{current_lr:.2e}",
                 "seq": current_stage["seq_len"]
             })
