@@ -250,7 +250,12 @@ def main():
         weight_decay=0.01 if stage_opt_type == "adafactor" else 0.1
     )
     warmup = cfg["training"].get("warmup_steps", 300)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps=warmup, max_steps=total_steps)
+    scheduler = get_cosine_schedule_with_warmup(
+    optimizer, 
+        warmup_steps=warmup, 
+        max_steps=total_steps,
+        last_epoch=start_step - 1 if start_step > 0 else -1   # <--- Fixes scheduler resume!
+    )
 
     streamer.set_seq_len(current_stage["seq_len"])
     batch_size = current_stage.get("batch_size", 4)
