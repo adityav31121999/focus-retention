@@ -1,16 +1,16 @@
 """
-scripts/kaggle_train.py
-=======================
-Unified, high-throughput training runner tailored for Kaggle GPU Notebooks (T4 x2, P100, A100).
-Supports single-GPU execution or high-throughput Dual-GPU Distributed Data Parallel (DDP).
+scripts/train_accelerator.py
+============================
+Universal 10,000-Step Pretraining Runner for both TPU (v5e / v3-8) and GPU (Dual T4 DDP, P100, A100).
+Checkpoints saved every 500 steps to /kaggle/working/mock_d1_weights.
 
 Usage:
 ------
-# 1. Dual-GPU High Throughput (Recommended on Kaggle GPU T4 x2):
-!torchrun --nproc_per_node=2 scripts/kaggle_train.py --model_size 1.7B --mode curriculum
+# 1. On GPU (Dual T4 DDP):
+!torchrun --nproc_per_node=2 scripts/train_accelerator.py --save_every 500
 
-# 2. Single-GPU Execution:
-!python scripts/kaggle_train.py --model_size 1.7B --mode curriculum
+# 2. On TPU (v5e-8 VM) or Single GPU / CPU:
+!python scripts/train_accelerator.py --save_every 500
 """
 
 import os
@@ -21,22 +21,36 @@ import argparse
 import yaml
 import torch
 import torch.nn as nn
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
-# Ensure repository root is on sys.path
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO_ROOT)
 os.chdir(REPO_ROOT)
 
 # ------------------------------------------------------------------------------
-# 1. Environment & Secrets Setup
+# 1. Hardware Detection & Device Setup
 # ------------------------------------------------------------------------------
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-if torch.cuda.is_available():
+is_tpu = False
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    # Register xla device module for autograd / checkpointing
+    if hasattr(torch, "_register_device_module"):
+        try:
+            torch._register_device_module("xla", torch_xla)
+        except Exception:
+            pass
+    torch.xla = torch_xla
+    device = torch_xla.device()
+    is_tpu = True
+except Exception:
+    pass
+
+if not is_tpu and torch.cuda.is_available():
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
 # Ingest Kaggle Secret HF_TOKEN if available
 try:
@@ -51,29 +65,27 @@ except Exception:
 from mock_d1 import MockD1Config, MockD1ForCausalLM
 from data.tokeniser import TokenizerManager
 from data.curriculum_streamer import CurriculumStreamer, create_curriculum_dataloader
-from data.hf_streamer import HuggingFaceStreamer, get_hf_dataloader
 from engine.optimiser import create_optimizer, get_cosine_schedule_with_warmup
 
 
 # ------------------------------------------------------------------------------
-# 2. Lightweight Checkpoint Manager (Kaggle Quota Guard)
+# 2. Checkpoint Manager
 # ------------------------------------------------------------------------------
-class KaggleCheckpointManager:
-    """
-    Saves strictly FP16 model weights and streamer progress to prevent filling
-    Kaggle's 57.6 GB disk quota. Keeps only the latest N checkpoints.
-    """
-    def __init__(self, output_dir: str = "/kaggle/working/mock_d1_weights", keep_last_n: int = 2, save_fp16: bool = True):
+class UniversalCheckpointManager:
+    def __init__(self, output_dir: str = "/kaggle/working/mock_d1_weights", keep_last_n: int = 3, save_half: bool = True):
         self.output_dir = output_dir
         self.keep_last_n = keep_last_n
-        self.save_fp16 = save_fp16
+        self.save_half = save_half
         os.makedirs(output_dir, exist_ok=True)
 
     def prune_old_checkpoints(self):
         ckpts = glob.glob(os.path.join(self.output_dir, "weights_step_*.pt"))
         if len(ckpts) <= self.keep_last_n:
             return
-        sorted_ckpts = sorted(ckpts, key=lambda x: int(os.path.basename(x).split("_")[-1].replace(".pt", "")))
+        sorted_ckpts = sorted(
+            ckpts,
+            key=lambda x: int(os.path.basename(x).split("_")[-1].replace(".pt", ""))
+        )
         for ckpt in sorted_ckpts[:-self.keep_last_n]:
             try:
                 os.remove(ckpt)
@@ -85,8 +97,11 @@ class KaggleCheckpointManager:
         path = os.path.join(self.output_dir, f"weights_step_{step}.pt")
         raw_model = model.module if hasattr(model, "module") else model
         state_dict = raw_model.state_dict()
-        if self.save_fp16:
-            state_dict = {k: v.half() if torch.is_floating_point(v) else v for k, v in state_dict.items()}
+        if self.save_half:
+            state_dict = {
+                k: (v.to(torch.bfloat16) if v.dtype == torch.bfloat16 else v.half()) if torch.is_floating_point(v) else v
+                for k, v in state_dict.items()
+            }
 
         torch.save({
             "step": step,
@@ -95,7 +110,7 @@ class KaggleCheckpointManager:
             "loss": loss
         }, path)
         size_mb = os.path.getsize(path) / (1024 * 1024)
-        print(f"💾 [Checkpoint] Saved model weights to {path} ({size_mb:.1f} MB)")
+        print(f"💾 [Checkpoint] Saved model weights at step {step} to {path} ({size_mb:.1f} MB)")
         self.prune_old_checkpoints()
 
     def load_latest(self, model: nn.Module, streamer=None):
@@ -109,7 +124,7 @@ class KaggleCheckpointManager:
 
         if not checkpoints:
             print("🚀 [Checkpoint] No previous weights found. Starting fresh from Step 0.")
-            return 0, None
+            return 0, None, None
 
         latest_file = max(checkpoints, key=lambda x: int(os.path.basename(x).split("_")[-1].replace(".pt", "")))
         print(f"🔄 [Checkpoint] Restoring model weights from {latest_file}...")
@@ -124,200 +139,239 @@ class KaggleCheckpointManager:
 
         step = state.get("step", 0)
         print(f"✅ Restored weights at Step {step} (Loss: {state.get('loss', 0.0):.4f})")
-        return step, streamer_state
+        return step, None, streamer_state
 
 
 # ------------------------------------------------------------------------------
-# 3. Main Execution Function
+# 3. Main Universal Training Loop
 # ------------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Kaggle Dual-GPU Training Runner (Mock-D1)")
-    parser.add_argument("--model_size", type=str, default="1.7B", choices=["1.7B", "1.7b", "7B", "7b"],
-                        help="Model size: '1.7B' (default) or '7B'")
-    parser.add_argument("--mode", type=str, default="curriculum", choices=["curriculum", "standard"],
-                        help="Training mode: 'curriculum' or 'standard'")
-    parser.add_argument("--config", type=str, default=None,
-                        help="Path to YAML config file (defaults to configs/curriculum_kaggle.yaml)")
-    parser.add_argument("--output_dir", type=str, default="/kaggle/working/mock_d1_weights",
-                        help="Directory to save weights")
-    parser.add_argument("--session_minutes", type=float, default=660.0,
-                        help="Max runtime timer in minutes (default: 660 mins / 11 hours)")
-    parser.add_argument("--gradient_checkpointing", action="store_true", default=True,
-                        help="Enable activation checkpointing")
+    parser = argparse.ArgumentParser(description="Universal TPU/GPU Pretraining Runner (Mock-D1)")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML curriculum config")
+    parser.add_argument("--save_every", type=int, default=500, help="Save checkpoint every N steps")
+    parser.add_argument("--output_dir", type=str, default="/kaggle/working/mock_d1_weights")
+    parser.add_argument("--session_hours", type=float, default=11.5, help="Safety cutoff hours")
     args = parser.parse_args()
 
-    # DDP Distributed Environment Setup
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    is_distributed = world_size > 1
-
-    if is_distributed:
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
+    # Hardware Configuration
+    if is_tpu:
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        dev = torch_xla.device()
+        target_dtype = torch.bfloat16
+        world_size = 1
+        local_rank = 0
+        is_distributed = False
+        accel_desc = f"Google Cloud TPU ({dev})"
+    elif torch.cuda.is_available():
+        import torch.distributed as dist
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        is_distributed = world_size > 1
+        if is_distributed:
+            dist.init_process_group(backend="nccl")
+            torch.cuda.set_device(local_rank)
+            dev = torch.device(f"cuda:{local_rank}")
+        else:
+            dev = torch.device("cuda:0")
+        target_dtype = torch.float16
+        accel_desc = f"NVIDIA CUDA GPUs: {world_size}"
     else:
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        dev = torch.device("cpu")
+        target_dtype = torch.float32
+        world_size = 1
+        local_rank = 0
+        is_distributed = False
+        accel_desc = "CPU"
 
-    # Resolve Configuration Path
-    if args.config is not None:
+    # Select config file
+    if args.config:
         config_path = args.config
-    elif args.mode == "curriculum":
-        config_path = "configs/curriculum_kaggle.yaml" if os.path.exists("configs/curriculum_kaggle.yaml") else "configs/curriculum_config.yaml"
+    elif is_tpu and os.path.exists("configs/curriculum_tpu.yaml"):
+        config_path = "configs/curriculum_tpu.yaml"
+    elif os.path.exists("configs/curriculum_kaggle.yaml"):
+        config_path = "configs/curriculum_kaggle.yaml"
     else:
-        config_path = "configs/default_config.yaml"
+        config_path = "configs/curriculum_config.yaml"
 
-    if local_rank == 0:
-        print(f"📖 Loading Kaggle configuration from: {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    # 1. Initialize Tokenizer
     tokenizer = TokenizerManager(cfg["data"]["tokenizer_name"])
-
-    # 2. Instantiate Model Directly in FP16 on this GPU (Avoids 6.8 GB FP32 spike)
     model_cfg = MockD1Config.from_dict(cfg["model"])
 
-    torch.set_default_dtype(torch.float16)
-    with torch.device(device):
+    # Instantiate Model directly in target precision on device
+    torch.set_default_dtype(target_dtype)
+    with torch.device(dev):
         model = MockD1ForCausalLM(model_cfg)
     torch.set_default_dtype(torch.float32)
 
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+    model.gradient_checkpointing_enable()
 
-    if is_distributed:
+    if not is_tpu and is_distributed:
+        from torch.nn.parallel import DistributedDataParallel as DDP
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
-    if local_rank == 0:
-        total_params = model.module.get_num_params() if is_distributed else model.get_num_params()
-        vram_used = torch.cuda.memory_allocated(local_rank) / 1e9
-        print(f"📊 Model: {model_cfg.model_name} | Parameters: {total_params:,} ({total_params / 1e9:.3f}B)")
-        print(f"💾 Initial Model VRAM: {vram_used:.2f} GB / 15.0 GB")
-        print(f"🎮 Active GPUs: {world_size} (Distributed DDP: {is_distributed})")
+    ckpt_manager = UniversalCheckpointManager(output_dir=args.output_dir, keep_last_n=3, save_half=True)
 
-    # 3. Setup Checkpoint Manager
-    output_dir = args.output_dir or cfg["training"].get("output_dir", "/kaggle/working/mock_d1_weights")
-    keep_n = cfg["training"].get("keep_last_n_checkpoints", 2)
-    ckpt_manager = KaggleCheckpointManager(output_dir=output_dir, keep_last_n=keep_n, save_fp16=True)
-
-    # 4. Setup Multi-Dataset Streamer
     streamer = CurriculumStreamer(
         tokenizer=tokenizer,
         datasets_list=cfg["data"].get("datasets", None),
         dataset_name=cfg["data"].get("dataset_name", "roneneldan/TinyStories"),
-        dataset_config=cfg["data"].get("dataset_config", None),
-        initial_seq_len=cfg["curriculum"]["stages"][0]["seq_len"] if args.mode == "curriculum" else cfg["data"]["seq_len"],
-        split=cfg["data"].get("split", "train"),
+        initial_seq_len=cfg["curriculum"]["stages"][0]["seq_len"],
+        split="train",
         buffer_size=cfg["data"].get("buffer_size", 25000),
-        seed=cfg["data"].get("seed", 42) + local_rank  # Diversify data stream across GPUs
+        seed=cfg["data"].get("seed", 42) + local_rank
     )
 
-    # Restore previous weights if resuming
-    start_step, _ = ckpt_manager.load_latest(model=model, streamer=streamer)
+    start_step, _, _ = ckpt_manager.load_latest(model=model, streamer=streamer)
 
-    # 5. Execute Training Loop
-    if args.mode == "curriculum":
-        stages = cfg["curriculum"]["stages"]
-        total_steps = stages[-1]["max_steps"]
-        session_sec = float(args.session_minutes) * 60.0
+    # 10,000 Total Steps
+    stages = cfg["curriculum"]["stages"]
+    total_steps = stages[-1]["max_steps"]
+    session_sec = float(args.session_hours) * 3600.0
 
-        current_stage_idx = 0
+    def get_stage(step):
         for idx, st in enumerate(stages):
-            if start_step < st["max_steps"]:
-                current_stage_idx = idx
-                break
-        current_stage = stages[current_stage_idx]
+            if step < st["max_steps"]:
+                return idx, st
+        return len(stages) - 1, stages[-1]
 
-        stage_opt_type = current_stage.get("optimizer", "adafactor" if current_stage_idx < 3 else "muon").lower()
-        stage_lr = float(current_stage["lr"])
-        optimizer = create_optimizer(
-            model,
-            optimizer_type=stage_opt_type,
-            lr=stage_lr,
-            muon_lr=stage_lr if stage_opt_type == "muon" else 0.02,
-            weight_decay=0.01 if stage_opt_type == "adafactor" else 0.1
-        )
-        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps=500, max_steps=total_steps)
+    current_stage_idx, current_stage = get_stage(start_step)
 
-        streamer.set_seq_len(current_stage["seq_len"])
-        dataloader = create_curriculum_dataloader(streamer, current_stage.get("batch_size", 2))
-        data_iter = iter(dataloader)
+    stage_opt_type = current_stage.get("optimizer", "adafactor" if current_stage_idx < 3 else "muon").lower()
+    stage_lr = float(current_stage["lr"])
+    optimizer = create_optimizer(
+        model,
+        optimizer_type=stage_opt_type,
+        lr=stage_lr,
+        muon_lr=stage_lr if stage_opt_type == "muon" else 0.02,
+        weight_decay=0.01 if stage_opt_type == "adafactor" else 0.1
+    )
+    warmup = cfg["training"].get("warmup_steps", 300)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps=warmup, max_steps=total_steps)
 
-        if local_rank == 0:
-            eff_tokens = current_stage.get("batch_size", 2) * world_size * current_stage["seq_len"] * current_stage.get("gradient_accumulation_steps", 8)
-            print("\n" + "=" * 70)
-            print(f"🚀 [Training Active] Stage {current_stage_idx + 1}: {current_stage['name']}")
-            print(f"   • Micro Batch/GPU : {current_stage.get('batch_size', 2)}")
-            print(f"   • Grad Accum Steps: {current_stage.get('gradient_accumulation_steps', 8)}")
-            print(f"   • Global Effective: {eff_tokens:,} tokens / step")
-            print(f"   • Active Optimizer: {stage_opt_type.upper()} | Base LR: {stage_lr:.2e}")
-            print("=" * 70 + "\n")
+    streamer.set_seq_len(current_stage["seq_len"])
+    batch_size = current_stage.get("batch_size", 4)
+    grad_accum = current_stage.get("gradient_accumulation_steps", 4)
+    dataloader = create_curriculum_dataloader(streamer, batch_size)
+    data_iter = iter(dataloader)
 
-        pbar = tqdm(total=total_steps, initial=start_step, desc="Kaggle Pretraining") if local_rank == 0 else None
-        step = start_step
-        start_time = time.time()
+    if local_rank == 0:
+        eff_tokens = batch_size * world_size * current_stage["seq_len"] * grad_accum
+        print("\n" + "=" * 75)
+        print(f"🚀 [Full 10k Training Active] {accel_desc} | Precision: {target_dtype}")
+        print(f"   • Starting Step      : {start_step:,}")
+        print(f"   • Target Total Steps : {total_steps:,}")
+        print(f"   • Checkpoint Save    : Every {args.save_every} steps")
+        print(f"   • Global Effective   : {eff_tokens:,} tokens / step")
+        print("=" * 75 + "\n")
 
-        model.train()
-        while step < total_steps:
-            # 11-hour session limit check
-            if (time.time() - start_time) >= session_sec:
-                if local_rank == 0:
-                    print("\n⏰ [Session Limit] 11-Hour limit reached. Saving final checkpoint...")
-                    ckpt_manager.save(step, model, streamer_state=streamer.state_dict(), loss=accum_loss)
-                break
+    pbar = tqdm(total=total_steps, initial=start_step, desc="10k Curriculum Training") if local_rank == 0 else None
+    step = start_step
+    start_time = time.time()
+    avg_loss = 0.0
 
-            grad_accum = current_stage.get("gradient_accumulation_steps", 8)
-            accum_loss = 0.0
-            optimizer.zero_grad(set_to_none=True)
+    model.train()
+    while step < total_steps:
+        if (time.time() - start_time) >= session_sec:
+            if local_rank == 0:
+                print("\n⏰ [Session Limit] Runtime cutoff approaching. Saving state...")
+            break
 
-            for _ in range(grad_accum):
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    dataloader = create_curriculum_dataloader(streamer, current_stage.get("batch_size", 2))
-                    data_iter = iter(dataloader)
-                    batch = next(data_iter)
+        active_idx, active_stage = get_stage(step)
+        if active_stage["name"] != current_stage["name"]:
+            current_stage_idx, current_stage = active_idx, active_stage
+            streamer.set_seq_len(current_stage["seq_len"])
+            batch_size = current_stage.get("batch_size", 4)
+            grad_accum = current_stage.get("gradient_accumulation_steps", 4)
+            dataloader = create_curriculum_dataloader(streamer, batch_size)
+            data_iter = iter(dataloader)
+            
+            stage_opt_type = current_stage.get("optimizer", "adafactor" if current_stage_idx < 3 else "muon").lower()
+            stage_lr = float(current_stage["lr"])
+            optimizer = create_optimizer(
+                model,
+                optimizer_type=stage_opt_type,
+                lr=stage_lr,
+                muon_lr=stage_lr if stage_opt_type == "muon" else 0.02,
+                weight_decay=0.01 if stage_opt_type == "adafactor" else 0.1
+            )
+            scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps=warmup, max_steps=total_steps)
 
-                input_ids = batch["input_ids"].to(device, non_blocking=True)
-                labels = batch["labels"].to(device, non_blocking=True)
+            if local_rank == 0:
+                print(f"\n🚀 Transitioned to Stage {current_stage_idx + 1}: {current_stage['name']}")
 
+        optimizer.zero_grad(set_to_none=True)
+        accum_loss_tensor = None
+
+        for _ in range(grad_accum):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                dataloader = create_curriculum_dataloader(streamer, batch_size)
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+
+            input_ids = batch["input_ids"].to(dev, non_blocking=True)
+            labels = batch["labels"].to(dev, non_blocking=True)
+
+            if not is_tpu and torch.cuda.is_available():
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    _, loss, _ = model(input_ids=input_ids, labels=labels)
+                    scaled_loss = loss / grad_accum
+            else:
                 _, loss, _ = model(input_ids=input_ids, labels=labels)
                 scaled_loss = loss / grad_accum
-                scaled_loss.backward()
-                accum_loss += scaled_loss.item()
 
+            scaled_loss.backward()
+
+            if accum_loss_tensor is None:
+                accum_loss_tensor = scaled_loss.detach()
+            else:
+                accum_loss_tensor = accum_loss_tensor + scaled_loss.detach()
+
+            if is_tpu:
+                import torch_xla.core.xla_model as xm
+                xm.mark_step()
+
+        if is_tpu:
+            import torch_xla.core.xla_model as xm
+            xm.optimizer_step(optimizer)
+            xm.mark_step()
+        else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            if scheduler:
-                scheduler.step()
 
-            step += 1
+        if scheduler:
+            scheduler.step()
 
-            if is_distributed:
-                loss_tensor = torch.tensor(accum_loss, device=device)
-                dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-                avg_loss = loss_tensor.item()
-            else:
-                avg_loss = accum_loss
-
-            if local_rank == 0 and pbar is not None:
-                current_lr = optimizer.param_groups[0]["lr"]
-                remaining_min = max(0.0, (session_sec - (time.time() - start_time)) / 60.0)
-                pbar.update(1)
-                pbar.set_postfix({
-                    "loss": f"{avg_loss:.4f}",
-                    "lr": f"{current_lr:.2e}",
-                    "seq": current_stage["seq_len"],
-                    "rem_time": f"{remaining_min:.1f}m"
-                })
-
-                if step % cfg["training"].get("save_every", 500) == 0:
-                    ckpt_manager.save(step, model, streamer_state=streamer.state_dict(), loss=avg_loss)
+        step += 1
+        avg_loss = accum_loss_tensor.item() if accum_loss_tensor is not None else 0.0
 
         if local_rank == 0 and pbar is not None:
-            pbar.close()
+            current_lr = optimizer.param_groups[0]["lr"]
+            pbar.update(1)
+            pbar.set_postfix({
+                "loss": f"{avg_loss:.4f}",
+                "lr": f"{current_lr:.2e}",
+                "seq": current_stage["seq_len"]
+            })
 
-    if is_distributed:
+            # Checkpoint every 500 steps
+            if step % args.save_every == 0:
+                ckpt_manager.save(step, model, streamer_state=streamer.state_dict(), loss=avg_loss)
+
+    if local_rank == 0:
+        if pbar is not None:
+            pbar.close()
+        if step % args.save_every != 0 or step == total_steps:
+            ckpt_manager.save(step, model, streamer_state=streamer.state_dict(), loss=avg_loss)
+        print(f"\n🏁 Finished Training at Step {step}/{total_steps}.")
+
+    if not is_tpu and is_distributed:
+        import torch.distributed as dist
         dist.destroy_process_group()
 
 
