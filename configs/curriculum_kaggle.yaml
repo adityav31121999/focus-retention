@@ -53,7 +53,7 @@ curriculum:
       max_steps: 2000
 
     # Stage 2: Paragraph Coherence (512 Context)
-    # Batch per step: 2 * 2 GPUs * 4 grad_accum = 16 batches = 8,192 tokens/step
+    # 2 per GPU x 2 GPUs x 4 grad_accum = 16 batches = 8,192 tokens/step
     - name: "Stage 2 (512)  [Adafactor]"
       seq_len: 512
       batch_size: 2
@@ -63,7 +63,7 @@ curriculum:
       max_steps: 4000
 
     # Stage 3: Multi-Paragraph Reasoning (2,048 Context)
-    # Batch per step: 1 * 2 GPUs * 4 grad_accum = 8 batches = 16,384 tokens/step
+    # 1 per GPU x 2 GPUs x 4 grad_accum = 8 batches = 16,384 tokens/step
     - name: "Stage 3 (2048) [Adafactor]"
       seq_len: 2048
       batch_size: 1
@@ -73,7 +73,7 @@ curriculum:
       max_steps: 6000
 
     # Stage 4: Long Document Attention [Muon Optimizer] (4,096 Context)
-    # Batch per step: 1 * 2 GPUs * 4 grad_accum = 8 batches = 32,768 tokens/step
+    # 1 per GPU x 2 GPUs x 4 grad_accum = 8 batches = 32,768 tokens/step
     - name: "Stage 4 (4096) [Muon]"
       seq_len: 4096
       batch_size: 1
@@ -82,12 +82,12 @@ curriculum:
       lr: 2.0e-2
       max_steps: 8000
 
-    # Stage 5: Architectural Context Stabilization (65k Context)
-    # +2,000 steps x 131,072 tokens = 262.14 Million tokens (~12 Hours)
-    - name: "Stage 5 (65k)  [Muon]"
-      seq_len: 65536
-      batch_size: 1                    # Chunked scan mode
-      gradient_accumulation_steps: 1   # 131,072 tokens per step
+    # Stage 5: Long Context Stabilization (8,192 Context — Safe for 15GB T4 VRAM)
+    # 1 per GPU x 2 GPUs x 4 grad_accum = 8 batches = 65,536 tokens/step
+    - name: "Stage 5 (8192) [Muon]"
+      seq_len: 32786
+      batch_size: 1
+      gradient_accumulation_steps: 4
       optimizer: "muon"
       lr: 1.0e-2
       max_steps: 10000
@@ -97,10 +97,10 @@ training:
   beta1: 0.9
   beta2: 0.95
   max_grad_norm: 1.0
-  warmup_steps: 300
+  warmup_steps: 200
   min_lr_ratio: 0.1
-  save_every: 100
-  session_duration_minutes: 60.0
+  save_every: 200
+  session_duration_minutes: 150.0      # 2.5 hours continuous execution
   keep_last_n_checkpoints: 3
   output_dir: "/kaggle/working/mock_d1_weights"
 
