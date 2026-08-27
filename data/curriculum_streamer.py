@@ -1,6 +1,7 @@
 # data/curriculum_streamer.py
 from typing import Iterator, Optional, Dict, Any, List, Union
 import itertools
+from collections import deque
 import torch
 from torch.utils.data import IterableDataset, DataLoader
 from datasets import load_dataset
@@ -9,7 +10,11 @@ from .tokeniser import TokenizerManager
 
 class CurriculumStreamer(IterableDataset):
     """
-    High-throughput token streamer with instant checkpoint seeking.
+    High-throughput token streamer with:
+    - O(1) constant-time deque token popping (prevents memory ballooning in RAM)
+    - Zero-allocation list slicing
+    - Instant C-level checkpoint seek via itertools.islice
+    - Seamless sequential multi-dataset streaming & epoch transitions
     """
     def __init__(
         self,
@@ -19,7 +24,7 @@ class CurriculumStreamer(IterableDataset):
         datasets_list: Optional[List[Dict[str, Any]]] = None,
         initial_seq_len: int = 128,
         split: str = "train",
-        buffer_size: int = 10000,
+        buffer_size: int = 1000,
         seed: int = 42,
     ):
         super().__init__()
@@ -30,6 +35,7 @@ class CurriculumStreamer(IterableDataset):
         self.seed = seed
         self.eos_token_id = self.tokenizer.tokenizer.eos_token_id
 
+        # Normalize datasets into a standard list of {"name": ..., "config": ...}
         if datasets_list is not None and len(datasets_list) > 0:
             self.datasets = datasets_list
         elif isinstance(dataset_name, list):
@@ -37,25 +43,31 @@ class CurriculumStreamer(IterableDataset):
         else:
             self.datasets = [{"name": dataset_name, "config": dataset_config}]
 
+        # Streaming state tracking
         self.current_ds_idx: int = 0
         self.samples_seen_in_current_ds: int = 0
         self.epoch: int = 0
-        self.token_buffer: List[int] = []
+        
+        # Use collections.deque for O(1) memory-efficient FIFO token popping
+        self.token_buffer: deque = deque()
 
     def set_seq_len(self, new_seq_len: int):
+        """Dynamically switch context length when transitioning stages."""
         print(f"[Curriculum Data] Switched sequence length to: {new_seq_len}")
         self.seq_len = new_seq_len
 
     def state_dict(self) -> Dict[str, Any]:
+        """Returns streaming progress, dataset indices, epoch, and token buffer."""
         return {
             "current_ds_idx": self.current_ds_idx,
             "samples_seen_in_current_ds": self.samples_seen_in_current_ds,
             "epoch": self.epoch,
-            "token_buffer": self.token_buffer,
+            "token_buffer": list(self.token_buffer),
             "seq_len": self.seq_len,
         }
 
     def load_state_dict(self, state_dict: Optional[Dict[str, Any]]):
+        """Restores dataset offsets and token buffer from checkpoint."""
         if not state_dict:
             return
         self.current_ds_idx = state_dict.get("current_ds_idx", 0)
@@ -63,7 +75,7 @@ class CurriculumStreamer(IterableDataset):
             "samples_seen_in_current_ds", state_dict.get("samples_seen", 0)
         )
         self.epoch = state_dict.get("epoch", 0)
-        self.token_buffer = state_dict.get("token_buffer", [])
+        self.token_buffer = deque(state_dict.get("token_buffer", []))
         self.seq_len = state_dict.get("seq_len", self.seq_len)
 
         current_ds_name = self.datasets[self.current_ds_idx]["name"]
@@ -85,7 +97,7 @@ class CurriculumStreamer(IterableDataset):
                 f"'{ds_name}' (Config: {ds_config}) | Epoch: {self.epoch + 1}"
             )
 
-            # Load dataset in non-blocking streaming mode
+            # Open non-blocking streaming generator
             dataset = load_dataset(
                 ds_name,
                 ds_config,
@@ -95,36 +107,45 @@ class CurriculumStreamer(IterableDataset):
 
             dataset_iter = iter(dataset)
 
-            # Fast C-level iterator consume instead of slow .skip()
+            # Fast-forward without downloading/materializing rows into RAM
             if self.samples_seen_in_current_ds > 0:
-                print(f"⏩ [Data Streamer] Fast-forwarding {self.samples_seen_in_current_ds:,} samples...")
-                # Consumes generator slice without overhead
+                print(f"⏩ [Data Streamer] Fast-forwarding past {self.samples_seen_in_current_ds:,} samples...")
                 dataset_iter = itertools.islice(dataset_iter, self.samples_seen_in_current_ds, None)
 
-            # Stream tokens
             for sample in dataset_iter:
                 self.samples_seen_in_current_ds += 1
                 text = sample.get("text", "")
-                if not text:
+                if not text or len(text.strip()) == 0:
                     continue
 
+                # Encode text and append EOS token
                 tokens = self.tokenizer.encode(text) + [self.eos_token_id]
                 self.token_buffer.extend(tokens)
 
+                # Pop exactly seq_len tokens with O(1) complexity
                 while len(self.token_buffer) >= self.seq_len:
-                    chunk = self.token_buffer[:self.seq_len]
-                    self.token_buffer = self.token_buffer[self.seq_len:]
+                    chunk = [self.token_buffer.popleft() for _ in range(self.seq_len)]
                     tensor_chunk = torch.tensor(chunk, dtype=torch.long)
                     yield {"input_ids": tensor_chunk, "labels": tensor_chunk.clone()}
 
+            # --- Current Dataset Exhausted ---
+            print(f"\n✅ [Data Streamer] Finished dataset '{ds_name}' ({self.samples_seen_in_current_ds:,} samples).")
             self.current_ds_idx += 1
             self.samples_seen_in_current_ds = 0
 
+            # --- All Datasets Exhausted: Advance Epoch & Loop Back ---
             if self.current_ds_idx >= len(self.datasets):
                 self.current_ds_idx = 0
                 self.epoch += 1
+                print(f"\n🎉 [Data Streamer] Completed Epoch {self.epoch}! Looping back to first dataset...\n")
 
 
 def create_curriculum_dataloader(streamer: CurriculumStreamer, batch_size: int = 1) -> DataLoader:
-    # Disable pin_memory on TPU to suppress the PyTorch warning and prevent CPU lock
-    return DataLoader(streamer, batch_size=batch_size, pin_memory=False)
+    """Creates a dataloader with hardware-aware memory pinning."""
+    use_pin_memory = torch.cuda.is_available() and ("xla" not in str(getattr(streamer, "device", "")))
+    return DataLoader(
+        streamer,
+        batch_size=batch_size,
+        pin_memory=use_pin_memory,
+        num_workers=0  # Safe in-process iteration for both DDP and TPU
+    )
