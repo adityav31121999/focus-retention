@@ -251,10 +251,10 @@ def main():
     )
     warmup = cfg["training"].get("warmup_steps", 300)
     scheduler = get_cosine_schedule_with_warmup(
-    optimizer, 
-        warmup_steps=warmup, 
+        optimizer,
+        warmup_steps=warmup,
         max_steps=total_steps,
-        last_epoch=start_step - 1 if start_step > 0 else -1   # <--- Fixes scheduler resume!
+        last_epoch=start_step - 1 if start_step > 0 else -1
     )
 
     streamer.set_seq_len(current_stage["seq_len"])
