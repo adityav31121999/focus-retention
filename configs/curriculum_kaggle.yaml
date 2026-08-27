@@ -1,6 +1,6 @@
 # ==============================================================================
-# Mock-D1 (1.7B) Progressive Curriculum — Kaggle (Dual T4 DDP / 2x GPUs)
-# Budget: Multi-Session Execution across 10,000 steps
+# Mock-D1 (1.7B) Maximum VRAM Progressive Curriculum — Dual T4 (2x 15GB GPUs)
+# Tuned for Maximum VRAM (~14GB/GPU) and Maximum Compute Saturation
 # ==============================================================================
 
 model:
@@ -42,38 +42,42 @@ model:
 
 curriculum:
   stages:
-    # Stage 1: Basic Word Syntax & Grammar (128 Context)
-    # 4 per GPU x 2 GPUs x 4 grad_accum = 32 batches = 4,096 tokens/step
+    # Stage 1: Basic Word Syntax (128 Context) — Max VRAM Mode
+    # 16 per GPU x 2 GPUs x 1 grad_accum = 32 batches = 4,096 tokens/step
+    # Target VRAM: ~13.8 GB / GPU (Fastest execution: ~0.8s/step)
     - name: "Stage 1 (128)  [Adafactor]"
       seq_len: 128
-      batch_size: 4
-      gradient_accumulation_steps: 4
+      batch_size: 16                   # Increased from 4 -> 16 to maximize VRAM
+      gradient_accumulation_steps: 1   # Zero loop overhead
       optimizer: "adafactor"
       lr: 1.0e-3
       max_steps: 2000
 
     # Stage 2: Paragraph Coherence (512 Context)
-    # 2 per GPU x 2 GPUs x 4 grad_accum = 16 batches = 8,192 tokens/step
+    # 8 per GPU x 2 GPUs x 1 grad_accum = 16 batches = 8,192 tokens/step
+    # Target VRAM: ~14.0 GB / GPU
     - name: "Stage 2 (512)  [Adafactor]"
       seq_len: 512
-      batch_size: 2
-      gradient_accumulation_steps: 4
+      batch_size: 8                    # Increased from 2 -> 8 to maximize VRAM
+      gradient_accumulation_steps: 1
       optimizer: "adafactor"
       lr: 8.0e-4
       max_steps: 4000
 
     # Stage 3: Multi-Paragraph Reasoning (2,048 Context)
-    # 1 per GPU x 2 GPUs x 4 grad_accum = 8 batches = 16,384 tokens/step
+    # 2 per GPU x 2 GPUs x 2 grad_accum = 8 batches = 16,384 tokens/step
+    # Target VRAM: ~14.2 GB / GPU
     - name: "Stage 3 (2048) [Adafactor]"
       seq_len: 2048
-      batch_size: 1
-      gradient_accumulation_steps: 4
+      batch_size: 2                    # Increased from 1 -> 2
+      gradient_accumulation_steps: 2
       optimizer: "adafactor"
       lr: 5.0e-4
       max_steps: 6000
 
-    # Stage 4: Long Document Attention [Muon Optimizer] (4,096 Context)
+    # Stage 4: Long Document Attention (4,096 Context)
     # 1 per GPU x 2 GPUs x 4 grad_accum = 8 batches = 32,768 tokens/step
+    # Target VRAM: ~14.0 GB / GPU
     - name: "Stage 4 (4096) [Muon]"
       seq_len: 4096
       batch_size: 1
@@ -82,10 +86,11 @@ curriculum:
       lr: 2.0e-2
       max_steps: 8000
 
-    # Stage 5: Long Context Stabilization (8,192 Context — Safe for 15GB T4 VRAM)
+    # Stage 5: Long Context Stabilization (8,192 Context)
     # 1 per GPU x 2 GPUs x 4 grad_accum = 8 batches = 65,536 tokens/step
+    # Target VRAM: ~14.5 GB / GPU
     - name: "Stage 5 (8192) [Muon]"
-      seq_len: 32786
+      seq_len: 8192
       batch_size: 1
       gradient_accumulation_steps: 4
       optimizer: "muon"
@@ -99,8 +104,8 @@ training:
   max_grad_norm: 1.0
   warmup_steps: 200
   min_lr_ratio: 0.1
-  save_every: 200
-  session_duration_minutes: 150.0      # 2.5 hours continuous execution
+  save_every: 100
+  session_duration_minutes: 150.0
   keep_last_n_checkpoints: 3
   output_dir: "/kaggle/working/mock_d1_weights"
 
