@@ -34,7 +34,7 @@ model:
   lora_deembed_rank: 128               # r = 128
   
   # Scan & Regularization
-  chunk_size: 512
+  chunk_size: 256
   use_chunked_scan: true
   rms_norm_eps: 1.0e-6
   initializer_range: 0.02
@@ -57,8 +57,8 @@ curriculum:
     # 2 per GPU x 2 GPUs x 4 grad_accum = 16 batches = 8,192 tokens/step
     - name: "Stage 2 (512)  [Adafactor]"
       seq_len: 512
-      batch_size: 2
-      gradient_accumulation_steps: 4
+      batch_size: 1                    # Set to 1 per GPU
+      gradient_accumulation_steps: 8   # Accumulate 8 steps to maintain 8,192 tokens
       optimizer: "adafactor"
       lr: 8.0e-4
       max_steps: 4000

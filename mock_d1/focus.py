@@ -280,7 +280,8 @@ class MockD1FocusAttention(nn.Module):
         gamma = torch.exp(-torch.exp(self.decay_param))
 
         if state is None:
-            if (self.config.curriculum_stage == 5 or self.config.use_chunked_scan) and C > self.chunk_size:
+            # Trigger chunked scan whenever sequence length is >= chunk_size
+            if (self.config.curriculum_stage >= 2 or self.config.use_chunked_scan) and C >= self.chunk_size:
                 A = ChunkedFocusAttentionFunction.apply(q, k, v, gamma, self.scale, self.chunk_size)
             else:
                 A = FocusAttentionFunction.apply(q, k, v, gamma, self.scale)
