@@ -56,9 +56,12 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
         dist = arange_b.unsqueeze(0) - arange_b.unsqueeze(1)
         mask = dist >= 0
         
-        # CORRECT BROADCASTING: [H, 1, 1] vs [1, chunk_size, chunk_size]
+        # 1. Shape gamma for intra-chunk decay: [H, 1, 1] vs [1, chunk_size, chunk_size]
         gamma_s = gamma.view(H, 1, 1)
         decay_weights = (gamma_s ** dist.unsqueeze(0).clamp(min=0)) * mask.unsqueeze(0).to(dtype)
+
+        # 2. Shape gamma for inter-chunk carry: [1, H, 1, 1, 1] (5D)
+        gamma_5d = gamma.view(1, H, 1, 1, 1)
 
         A = torch.empty_like(v)
         boundary_states = torch.zeros(num_chunks + 1, B, H, d_h, d_h, device=q.device, dtype=dtype)
@@ -75,8 +78,10 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
             v_c = v[:, :, start:end]
 
             P_c = scale * torch.matmul(q_c.unsqueeze(-1), k_c.unsqueeze(-2))
+            
+            # Power vector shaped as [1, 1, curr_len, 1, 1]
             power = torch.arange(1, curr_len + 1, device=q.device).view(1, 1, curr_len, 1, 1)
-            carry_decay = (gamma ** power) * curr_state.unsqueeze(2)
+            carry_decay = (gamma_5d ** power) * curr_state.unsqueeze(2)
 
             decay_c = decay_weights[:, :curr_len, :curr_len].unsqueeze(0)
             P_flat = P_c.view(B, H, curr_len, d_h * d_h)
@@ -115,9 +120,9 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
         dist = arange_b.unsqueeze(0) - arange_b.unsqueeze(1)
         mask = dist >= 0
         
-        # CORRECT BROADCASTING: [H, 1, 1] vs [1, chunk_size, chunk_size]
         gamma_s = gamma.view(H, 1, 1)
         decay_weights = (gamma_s ** dist.unsqueeze(0).clamp(min=0)) * mask.unsqueeze(0).to(dtype)
+        gamma_5d = gamma.view(1, H, 1, 1, 1)
 
         curr_grad_carry = torch.zeros(B, H, d_h, d_h, device=q.device, dtype=dtype)
 
@@ -134,7 +139,7 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
 
             P_c = scale * torch.matmul(q_c.unsqueeze(-1), k_c.unsqueeze(-2))
             power = torch.arange(1, curr_len + 1, device=q.device).view(1, 1, curr_len, 1, 1)
-            carry_decay = (gamma ** power) * start_state.unsqueeze(2)
+            carry_decay = (gamma_5d ** power) * start_state.unsqueeze(2)
             decay_c = decay_weights[:, :curr_len, :curr_len].unsqueeze(0)
             P_flat = P_c.view(B, H, curr_len, d_h * d_h)
             intra_accum = torch.matmul(decay_c, P_flat).view(B, H, curr_len, d_h, d_h)
@@ -280,7 +285,6 @@ class MockD1FocusAttention(nn.Module):
         gamma = torch.exp(-torch.exp(self.decay_param))
 
         if state is None:
-            # Trigger memory-efficient chunked scan whenever sequence length >= chunk_size
             if (self.config.curriculum_stage >= 2 or self.config.use_chunked_scan) and C >= self.chunk_size:
                 A = ChunkedFocusAttentionFunction.apply(q, k, v, gamma, self.scale, self.chunk_size)
             else:
