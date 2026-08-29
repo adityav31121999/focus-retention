@@ -22,7 +22,6 @@ class FocusRoPE(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("cos_cached", torch.empty(0), persistent=False)
         self.register_buffer("sin_cached", torch.empty(0), persistent=False)
-        # Start with a lightweight 2048-token cache
         self._build_cache(2048)
 
     def _build_cache(self, seq_len: int):
@@ -38,7 +37,6 @@ class FocusRoPE(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
     def forward(self, x: torch.Tensor, seq_len: int, offset: int = 0) -> torch.Tensor:
-        # Expand cache dynamically only when context exceeds current buffer
         if self.cos_cached.numel() == 0 or (offset + seq_len > self.cos_cached.shape[2]):
             self._build_cache(max(offset + seq_len, 2048))
         cos = self.cos_cached[:, :, offset : offset + seq_len, :].to(x.dtype)
@@ -57,7 +55,9 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
         arange_b = torch.arange(chunk_size, device=q.device)
         dist = arange_b.unsqueeze(0) - arange_b.unsqueeze(1)
         mask = dist >= 0
-        gamma_s = gamma.squeeze(0).squeeze(-1)
+        
+        # CORRECT BROADCASTING: [H, 1, 1] vs [1, chunk_size, chunk_size]
+        gamma_s = gamma.view(H, 1, 1)
         decay_weights = (gamma_s ** dist.unsqueeze(0).clamp(min=0)) * mask.unsqueeze(0).to(dtype)
 
         A = torch.empty_like(v)
@@ -114,7 +114,9 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
         arange_b = torch.arange(chunk_size, device=q.device)
         dist = arange_b.unsqueeze(0) - arange_b.unsqueeze(1)
         mask = dist >= 0
-        gamma_s = gamma.squeeze(0).squeeze(-1)
+        
+        # CORRECT BROADCASTING: [H, 1, 1] vs [1, chunk_size, chunk_size]
+        gamma_s = gamma.view(H, 1, 1)
         decay_weights = (gamma_s ** dist.unsqueeze(0).clamp(min=0)) * mask.unsqueeze(0).to(dtype)
 
         curr_grad_carry = torch.zeros(B, H, d_h, d_h, device=q.device, dtype=dtype)
@@ -145,7 +147,6 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
             sum_grad_S = torch.sum(grad_S_c * S_c, dim=-1, keepdim=True)
             grad_M_c = S_c * (grad_S_c - sum_grad_S)
 
-            # Free temporary Jacobian buffers immediately
             del grad_S_c, sum_grad_S
 
             grad_M_c[:, :, -1] += curr_grad_carry
@@ -215,7 +216,6 @@ class FocusAttentionFunction(torch.autograd.Function):
         sum_grad_S = torch.sum(grad_S * S, dim=-1, keepdim=True)
         grad_M = S * (grad_S - sum_grad_S)
 
-        # Free temporary Jacobian buffers immediately
         del grad_S, sum_grad_S
 
         grad_P = torch.zeros_like(grad_M)
@@ -280,7 +280,7 @@ class MockD1FocusAttention(nn.Module):
         gamma = torch.exp(-torch.exp(self.decay_param))
 
         if state is None:
-            # Trigger chunked scan whenever sequence length is >= chunk_size
+            # Trigger memory-efficient chunked scan whenever sequence length >= chunk_size
             if (self.config.curriculum_stage >= 2 or self.config.use_chunked_scan) and C >= self.chunk_size:
                 A = ChunkedFocusAttentionFunction.apply(q, k, v, gamma, self.scale, self.chunk_size)
             else:

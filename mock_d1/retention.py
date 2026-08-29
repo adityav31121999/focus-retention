@@ -219,7 +219,7 @@ class MockD1RetentionMechanism(nn.Module):
             k = self.w_k_expand(l_kv_curr)
             v = self.w_v_expand(l_kv_curr)
             
-            if (self.config.curriculum_stage >= 2 or self.config.use_chunked_scan) and C >= self.chunk_size:
+            if (self.config.curriculum_stage == 5 or self.config.use_chunked_scan) and C > self.chunk_size:
                 A = ChunkedRetentionFunction.apply(q, k, v, self.scale, self.phi_act, self.chunk_size)
             else:
                 A = RetentionFunction.apply(q, k, v, self.scale, self.phi_act)
