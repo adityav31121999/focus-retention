@@ -79,17 +79,18 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
 
             P_c = scale * torch.matmul(q_c.unsqueeze(-1), k_c.unsqueeze(-2))
             
-            # Power vector shaped as [1, 1, curr_len, 1, 1]
-            power = torch.arange(1, curr_len + 1, device=q.device).view(1, 1, curr_len, 1, 1)
-            carry_decay = (gamma_5d ** power) * curr_state.unsqueeze(2)
-
             decay_c = decay_weights[:, :curr_len, :curr_len].unsqueeze(0)
             P_flat = P_c.view(B, H, curr_len, d_h * d_h)
-            intra_accum = torch.matmul(decay_c, P_flat).view(B, H, curr_len, d_h, d_h)
+            
+            # 1. Allocate intra-chunk accumulation directly in M_c
+            M_c = torch.matmul(decay_c, P_flat).view(B, H, curr_len, d_h, d_h)
+            del P_flat, P_c
 
-            M_c = carry_decay + intra_accum
+            # 2. Add carry decay in-place (avoids allocating temporary 5D tensors)
+            power = torch.arange(1, curr_len + 1, device=q.device).view(1, 1, curr_len, 1, 1)
+            M_c.add_((gamma_5d ** power) * curr_state.unsqueeze(2))
+
             S_c = F.softmax(M_c, dim=-1).to(dtype)
-
             A[:, :, start:end] = torch.matmul(v_c.unsqueeze(-2), S_c).squeeze(-2)
 
             curr_state = M_c[:, :, -1]
@@ -138,16 +139,22 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
             start_state = boundary_states[c_idx]
 
             P_c = scale * torch.matmul(q_c.unsqueeze(-1), k_c.unsqueeze(-2))
-            power = torch.arange(1, curr_len + 1, device=q.device).view(1, 1, curr_len, 1, 1)
-            carry_decay = (gamma_5d ** power) * start_state.unsqueeze(2)
             decay_c = decay_weights[:, :curr_len, :curr_len].unsqueeze(0)
             P_flat = P_c.view(B, H, curr_len, d_h * d_h)
-            intra_accum = torch.matmul(decay_c, P_flat).view(B, H, curr_len, d_h, d_h)
-            M_c = carry_decay + intra_accum
+            
+            # Reconstruct M_c in-place
+            M_c = torch.matmul(decay_c, P_flat).view(B, H, curr_len, d_h, d_h)
+            del P_flat, P_c
+
+            power = torch.arange(1, curr_len + 1, device=q.device).view(1, 1, curr_len, 1, 1)
+            M_c.add_((gamma_5d ** power) * start_state.unsqueeze(2))
+            
             S_c = F.softmax(M_c, dim=-1).to(dtype)
 
+            # Gradient V
             grad_V[:, :, start:end] = torch.matmul(gA_c.unsqueeze(-2), S_c.transpose(-1, -2)).squeeze(-2)
 
+            # Softmax VJP
             grad_S_c = torch.matmul(v_c.unsqueeze(-1), gA_c.unsqueeze(-2))
             sum_grad_S = torch.sum(grad_S_c * S_c, dim=-1, keepdim=True)
             grad_M_c = S_c * (grad_S_c - sum_grad_S)
@@ -165,7 +172,7 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
                 prev_M = start_state if t == 0 else M_c[:, :, t - 1]
                 grad_gamma += torch.sum(curr_grad_P * prev_M, dim=(0, 2, 3), keepdim=True)
 
-            del grad_M_c
+            del grad_M_c, M_c
 
             curr_grad_carry = curr_grad_P * gamma
 
@@ -251,7 +258,7 @@ class MockD1FocusAttention(nn.Module):
         self.scale = 1.0 / math.sqrt(self.head_dim)
         self.use_rope = config.use_rope
         self.use_decay = config.use_focus_decay
-        self.chunk_size = config.chunk_size
+        self.chunk_size = getattr(config, "chunk_size", 128)
 
         self.q_proj = nn.Linear(self.hidden_dim, self.kqv_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_dim, self.kqv_dim, bias=False)
@@ -285,7 +292,7 @@ class MockD1FocusAttention(nn.Module):
         gamma = torch.exp(-torch.exp(self.decay_param))
 
         if state is None:
-            if (self.config.curriculum_stage >= 2 or self.config.use_chunked_scan) and C >= self.chunk_size:
+            if C >= self.chunk_size:
                 A = ChunkedFocusAttentionFunction.apply(q, k, v, gamma, self.scale, self.chunk_size)
             else:
                 A = FocusAttentionFunction.apply(q, k, v, gamma, self.scale)
