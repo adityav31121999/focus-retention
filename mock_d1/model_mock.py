@@ -181,14 +181,32 @@ class MockD1ForCausalLM(nn.Module):
 
         loss = None
         if labels is not None:
-            # Shift tokens for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Calculate cross-entropy in float32 for mixed-precision numerical stability
-            loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.vocab_size).float(),
-                shift_labels.view(-1)
-            )
+            
+            flat_logits = shift_logits.view(-1, self.config.vocab_size)
+            flat_labels = shift_labels.view(-1)
+
+            # Chunked cross-entropy to prevent >500MB VRAM spikes
+            loss_chunk_size = 256
+            total_tokens = flat_logits.size(0)
+            
+            if total_tokens > loss_chunk_size:
+                losses = []
+                for i in range(0, total_tokens, loss_chunk_size):
+                    end_idx = min(i + loss_chunk_size, total_tokens)
+                    chunk_loss = F.cross_entropy(
+                        flat_logits[i:end_idx].float(),
+                        flat_labels[i:end_idx],
+                        reduction="sum"
+                    )
+                    losses.append(chunk_loss)
+                loss = torch.stack(losses).sum() / total_tokens
+            else:
+                loss = F.cross_entropy(
+                    flat_logits.float(),
+                    flat_labels
+                )
 
         return logits, loss, next_states
 
