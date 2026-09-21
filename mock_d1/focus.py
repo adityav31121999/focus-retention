@@ -53,7 +53,7 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
         num_chunks = (C + chunk_size - 1) // chunk_size
 
         arange_b = torch.arange(chunk_size, device=q.device)
-        dist = arange_b.unsqueeze(0) - arange_b.unsqueeze(1)
+        dist = arange_b.unsqueeze(1) - arange_b.unsqueeze(0)
         mask = dist >= 0
         
         # 1. Shape gamma for intra-chunk decay: [H, 1, 1] vs [1, chunk_size, chunk_size]
@@ -118,7 +118,7 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
         grad_gamma = torch.zeros_like(gamma)
 
         arange_b = torch.arange(chunk_size, device=q.device)
-        dist = arange_b.unsqueeze(0) - arange_b.unsqueeze(1)
+        dist = arange_b.unsqueeze(1) - arange_b.unsqueeze(0)
         mask = dist >= 0
         
         gamma_s = gamma.view(H, 1, 1)
@@ -163,18 +163,18 @@ class ChunkedFocusAttentionFunction(torch.autograd.Function):
 
             grad_M_c[:, :, -1] += curr_grad_carry
 
-            grad_P_c = torch.zeros_like(grad_M_c)
-            curr_grad_P = torch.zeros(B, H, d_h, d_h, device=q.device, dtype=dtype)
-
-            for t in reversed(range(curr_len)):
-                curr_grad_P = grad_M_c[:, :, t] + gamma * curr_grad_P
-                grad_P_c[:, :, t] = curr_grad_P
-                prev_M = start_state if t == 0 else M_c[:, :, t - 1]
-                grad_gamma += torch.sum(curr_grad_P * prev_M, dim=(0, 2, 3), keepdim=True)
+            # Transpose of the causal decay operator is the reverse scan.
+            # One batched matmul replaces curr_len Python/autograd graph steps.
+            grad_P_c = torch.matmul(
+                decay_c.transpose(-1, -2),
+                grad_M_c.reshape(B, H, curr_len, d_h * d_h),
+            ).reshape(B, H, curr_len, d_h, d_h)
+            prev_M = torch.cat((start_state.unsqueeze(2), M_c[:, :, :-1]), dim=2)
+            grad_gamma += (grad_P_c * prev_M).sum(dim=(0, 2, 3, 4)).view_as(gamma)
 
             del grad_M_c, M_c
 
-            curr_grad_carry = curr_grad_P * gamma
+            curr_grad_carry = grad_P_c[:, :, 0] * gamma
 
             grad_Q[:, :, start:end] = scale * torch.matmul(k_c.unsqueeze(-2), grad_P_c.transpose(-1, -2)).squeeze(-2)
             grad_K[:, :, start:end] = scale * torch.matmul(q_c.unsqueeze(-2), grad_P_c).squeeze(-2)
@@ -292,10 +292,8 @@ class MockD1FocusAttention(nn.Module):
         gamma = torch.exp(-torch.exp(self.decay_param))
 
         if state is None:
-            if C >= self.chunk_size:
-                A = ChunkedFocusAttentionFunction.apply(q, k, v, gamma, self.scale, self.chunk_size)
-            else:
-                A = FocusAttentionFunction.apply(q, k, v, gamma, self.scale)
+            # Even short sequences must avoid the reference token-by-token loop.
+            A = ChunkedFocusAttentionFunction.apply(q, k, v, gamma, self.scale, min(C, self.chunk_size))
             next_state = None
         else:
             delta_M = self.scale * torch.matmul(q.transpose(-1, -2), k)

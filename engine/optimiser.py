@@ -166,18 +166,20 @@ class Adafactor(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        updated = 0
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
                     continue
+                if p.grad.is_sparse:
+                    raise RuntimeError("Adafactor does not support sparse gradients")
                 grad = p.grad
                 if grad.dtype in {torch.float16, torch.bfloat16}:
                     grad = grad.float()
 
                 state = self.state[p]
                 if len(state) == 0:
-                    state["step"] = 0
-                    state["RMS"] = 0.0
+                    state["step"] = torch.zeros((), device=p.device, dtype=torch.float32)
                     if group["beta1"] is not None:
                         state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
                     if grad.ndim >= 2:
@@ -186,14 +188,47 @@ class Adafactor(torch.optim.Optimizer):
                     else:
                         state["exp_avg_sq"] = torch.zeros_like(grad, dtype=torch.float32)
 
-                state["step"] += 1
-                state["RMS"] = torch.sqrt(torch.mean(p.float() ** 2))
+                # Tensor-valued counters/LRs keep the XLA graph identical on
+                # successive updates; no .item() or Python step constants.
+                if not torch.is_tensor(state["step"]):
+                    state["step"] = torch.tensor(float(state["step"]), device=p.device)
+                elif state["step"].device != p.device:
+                    state["step"] = state["step"].to(p.device)
+                state["step"].add_(1)
                 lr = group["lr"]
+                if group["relative_step"]:
+                    cap = state["step"] * 1e-6 if group["warmup_init"] else torch.full_like(state["step"], 1e-2)
+                    lr = torch.minimum(cap, state["step"].rsqrt())
+                if group["scale_parameter"]:
+                    rms = p.float().square().mean().sqrt()
+                    lr = lr * rms.clamp_min(group["eps2"][1])
 
+                beta2 = 1.0 - state["step"].pow(group["decay_rate"])
+                squared = grad.square().add(group["eps2"][0])
+                if grad.ndim >= 2:
+                    row, col = state["exp_avg_sq_row"], state["exp_avg_sq_col"]
+                    row.mul_(beta2).add_(squared.mean(dim=-1) * (1 - beta2))
+                    col.mul_(beta2).add_(squared.mean(dim=-2) * (1 - beta2))
+                    row_factor = (row / row.mean(dim=-1, keepdim=True)).rsqrt().unsqueeze(-1)
+                    update = grad * row_factor * col.rsqrt().unsqueeze(-2)
+                else:
+                    moment = state["exp_avg_sq"]
+                    moment.mul_(beta2).add_(squared * (1 - beta2))
+                    update = grad * moment.rsqrt()
+                update = update / (update.square().mean().sqrt() / group["clip_threshold"]).clamp_min(1)
+                update = update * lr
+                if group["beta1"] is not None:
+                    moment = state["exp_avg"]
+                    moment.mul_(group["beta1"]).add_(update * (1 - group["beta1"]))
+                    update = moment
                 if group["weight_decay"] != 0.0:
-                    p.add_(p, alpha=-group["weight_decay"] * lr)
-
-                p.add_(grad.to(p.dtype), alpha=-lr)
+                    p.mul_(1 - group["weight_decay"] * lr)
+                p.add_(-update.to(p.dtype))
+                updated += 1
+                interval = getattr(self, "xla_parameters_per_graph", 0)
+                if p.device.type == "xla" and interval and updated % interval == 0:
+                    import torch_xla.core.xla_model as xm
+                    xm.mark_step()
         return loss
 
 

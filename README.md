@@ -2,6 +2,8 @@
 
 This repository is for experimental **focus-retention** architecture. Using this, we will train a 7B parameter model.
 
+For standalone mini-model training on dual T4 GPUs or TPU v5e-8, see the [training scripts and commands](scripts/TRAINING.md). These entry points include distributed launch, fixed-shape training, checkpoint resume, and controls for XLA graph size.
+
 ## FOCUS ATTENTION
 
 Let `S` be the scaled dot product of `Q` and `K` transpose.

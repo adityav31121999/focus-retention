@@ -41,6 +41,7 @@ class ChunkedRetentionFunction(torch.autograd.Function):
         A = torch.empty_like(v)
 
         running_prefix_S = torch.empty(0, device=q.device, dtype=dtype)
+        boundaries = []
 
         for c_idx in range(num_chunks):
             start = c_idx * chunk_size
@@ -50,6 +51,9 @@ class ChunkedRetentionFunction(torch.autograd.Function):
             q_c = q[:, start:end]
             k_c = k[:, :end]
             v_c = v[:, :end]
+            # Only a boundary vector is needed to reconstruct this chunk.
+            boundaries.append(F.pad(running_prefix_S, (0, C - start)) if start else
+                              torch.zeros(B, 1, C, device=q.device, dtype=dtype))
 
             causal_mask = torch.tril(torch.ones(curr_len, end, device=q.device, dtype=torch.bool), diagonal=start)
             score_c = torch.matmul(q_c, k_c.transpose(-1, -2)) * scale
@@ -67,7 +71,7 @@ class ChunkedRetentionFunction(torch.autograd.Function):
 
             A[:, start:end] = torch.matmul(alpha_c, v_c)
 
-        ctx.save_for_backward(q, k, v)
+        ctx.save_for_backward(q, k, v, torch.stack(boundaries))
         ctx.scale = scale
         ctx.phi_act = phi_act
         ctx.chunk_size = chunk_size
@@ -75,7 +79,7 @@ class ChunkedRetentionFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_A: torch.Tensor):
-        q, k, v = ctx.saved_tensors
+        q, k, v, boundaries = ctx.saved_tensors
         dtype = q.dtype
         grad_A = grad_A.to(dtype)
         scale = ctx.scale
@@ -104,17 +108,7 @@ class ChunkedRetentionFunction(torch.autograd.Function):
             score_c = torch.matmul(q_c, k_c.transpose(-1, -2)) * scale
             phi_c = _phi(score_c, phi_act).masked_fill(~causal_mask, 0.0)
 
-            if start > 0:
-                full_q_prefix = q[:, :start]
-                full_k_prefix = k[:, :start]
-                full_score_prefix = torch.matmul(full_q_prefix, full_k_prefix.transpose(-1, -2)) * scale
-                full_mask_prefix = torch.tril(torch.ones(start, start, device=q.device, dtype=torch.bool))
-                full_phi_prefix = _phi(full_score_prefix, phi_act).masked_fill(~full_mask_prefix, 0.0)
-                prefix_sum = torch.sum(full_phi_prefix, dim=-2, keepdim=True)
-                S_c = torch.cumsum(phi_c, dim=-2)
-                S_c[:, :, :start] += prefix_sum
-            else:
-                S_c = torch.cumsum(phi_c, dim=-2)
+            S_c = torch.cumsum(phi_c, dim=-2) + boundaries[c_idx, :, :, :end]
 
             alpha_c = F.softmax(S_c.masked_fill(~causal_mask, -1e4 if dtype == torch.float16 else float("-inf")), dim=-1).to(dtype)
 
@@ -216,13 +210,16 @@ class MockD1RetentionMechanism(nn.Module):
         l_kv_curr = self.w_kv_latent(x)
 
         if state is None:
-            k = self.w_k_expand(l_kv_curr)
-            v = self.w_v_expand(l_kv_curr)
+            # Exact reassociation of the bias-free latent projections. Keep
+            # the original 1/sqrt(kqv_dim) scaling and all score nonlinearities.
+            q_latent = torch.matmul(q, self.w_k_expand.weight)
+            k = v = l_kv_curr
             
             if (self.config.curriculum_stage == 5 or self.config.use_chunked_scan) and C > self.chunk_size:
-                A = ChunkedRetentionFunction.apply(q, k, v, self.scale, self.phi_act, self.chunk_size)
+                A = ChunkedRetentionFunction.apply(q_latent, k, v, self.scale, self.phi_act, self.chunk_size)
             else:
-                A = RetentionFunction.apply(q, k, v, self.scale, self.phi_act)
+                A = RetentionFunction.apply(q_latent, k, v, self.scale, self.phi_act)
+            A = self.w_v_expand(A)
             next_state = None
         else:
             prev_l_kv = state.get("l_kv_cache", None)

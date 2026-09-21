@@ -1,0 +1,11 @@
+notebook
+.venv/
+.tmp/
+__pycache__/
+.pytest_cache/
+checkpoints/
+.xla_cache/
+__pycache__
+.tmp
+.venv
+.pytest_cache

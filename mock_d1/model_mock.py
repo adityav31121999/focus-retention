@@ -10,6 +10,29 @@ from .feedforward import RMSNorm
 from .block import MockD1Block
 
 
+class _XLAGraphBoundary(torch.autograd.Function):
+    """Bound lazy graph size in both directions without detaching gradients."""
+    @staticmethod
+    def forward(ctx, x):
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
+        return grad
+
+
+def checkpoint_training(function, *args):
+    if args[0].device.type == "xla":
+        # XLA's implementation preserves XLA autocast during recomputation.
+        from torch_xla.utils.checkpoint import checkpoint as xla_checkpoint
+        return xla_checkpoint(function, *args, use_reentrant=True, preserve_rng_state=False)
+    return checkpoint.checkpoint(function, *args, use_reentrant=False, preserve_rng_state=False)
+
+
 def init_laplace_weights_(tensor: torch.Tensor, scale: float = 0.02, min_val: float = -1.0, max_val: float = 1.0):
     """
     Initializes tensor in-place with Laplace distribution centered at 0.0
@@ -76,6 +99,7 @@ class MockD1Model(nn.Module):
         self.blocks = nn.ModuleList([MockD1Block(config) for _ in range(config.num_blocks)])
         self.norm = RMSNorm(config.hidden_dim, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
+        self.xla_graph_blocks = 0
 
     def get_num_params(self, trainable_only: bool = False) -> int:
         """Returns total parameter count of the base model."""
@@ -107,28 +131,13 @@ class MockD1Model(nn.Module):
                         return out
                     return custom_forward
 
-                # --- Device-Specific Safe Activation Checkpointing ---
-                if is_xla:
-                    # TPU / XLA: Must use reentrant mode and disable RNG state preservation
-                    h = checkpoint.checkpoint(
-                        create_custom_forward(block),
-                        h,
-                        x0,
-                        use_reentrant=True,
-                        preserve_rng_state=False
-                    )
-                else:
-                    # CUDA GPU / ROCm / CPU: Modern non-reentrant checkpointing
-                    h = checkpoint.checkpoint(
-                        create_custom_forward(block),
-                        h,
-                        x0,
-                        use_reentrant=False
-                    )
+                h = checkpoint_training(create_custom_forward(block), h, x0)
             else:
                 h, next_block_states = block(h, x0=x0, states=block_states, seq_offset=seq_offset)
                 if new_states is not None:
                     new_states.append(next_block_states)
+            if is_xla and self.training and self.xla_graph_blocks and (i + 1) % self.xla_graph_blocks == 0:
+                h = _XLAGraphBoundary.apply(h)
 
         h = self.norm(h)
         return h, new_states
@@ -173,10 +182,31 @@ class MockD1ForCausalLM(nn.Module):
         input_ids: torch.LongTensor,
         labels: Optional[torch.LongTensor] = None,
         past_states: Optional[List[List[Optional[torch.Tensor]]]] = None,
-        seq_offset: int = 0
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[List[Optional[torch.Tensor]]]]]:
+        seq_offset: int = 0,
+        return_logits: bool = True,
+        loss_chunk_size: int = 128,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[List[List[Optional[torch.Tensor]]]]]:
         
         hidden_states, next_states = self.model(input_ids, past_states=past_states, seq_offset=seq_offset)
+        if labels is not None and not return_logits:
+            if loss_chunk_size < 1 or input_ids.shape[1] < 2:
+                raise ValueError("Loss chunk size must be positive and sequence length at least two")
+            hidden = hidden_states[:, :-1].reshape(-1, self.config.hidden_dim)
+            targets = labels[:, 1:].reshape(-1)
+
+            def projected_loss(h, target):
+                return F.cross_entropy(self.lm_head(h).float(), target, reduction="sum", ignore_index=-100)
+
+            losses = []
+            for start in range(0, targets.numel(), loss_chunk_size):
+                h = hidden[start:start + loss_chunk_size]
+                target = targets[start:start + loss_chunk_size]
+                value = checkpoint_training(projected_loss, h, target) if self.training and torch.is_grad_enabled() else projected_loss(h, target)
+                if h.device.type == "xla" and self.model.xla_graph_blocks:
+                    value = _XLAGraphBoundary.apply(value)
+                losses.append(value)
+            loss = torch.stack(losses).sum() / (targets != -100).sum().clamp_min(1)
+            return None, loss, next_states
         logits = self.lm_head(hidden_states)
 
         loss = None
