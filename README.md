@@ -68,7 +68,7 @@ For memory footprint reduction, we will use concept similar to Deepseek MHLA.
 
 ## Un-Embedding
 
-De-embedding or un-embedding will be used to produce output of transformer, which will be softmaxed to get probability distribution. To get this un-embedding, we add product of $A$ and $B$ to $E$. These $A$ and $B$ are LoRA adapters.
+**De-embedding** or **un-embedding** will be used to produce output of transformer, which will be softmaxed to get probability distribution. To get this un-embedding, we add product of $A$ and $B$ to $E$. These $A$ and $B$ are LoRA adapters.
 
 $$D = E^T + (A \times B)$$
 
@@ -213,7 +213,9 @@ This model is based on focus attention and recursion based retention mechanism c
 - 3:1 ratio for Focus and Retention Layer per block. Total 9 blocks, i.e., 27 Focus and 9 Retention heads.
 - Focus Layer will have 32 heads, and Retention layer will always have only `one` head.
 - All retention heads use global attention with latent KV-cache.
-
+- For MoE:
+   - Router weights will be added.
+   - Shared expert, System Expert, Prompt Expert and Routed experts will be selected for each context.
 
 ### Structure
 
@@ -292,14 +294,15 @@ Token injection maintains the continuity of original information, while residual
 
 ## 25B and 100B
 
-- These will be reasoning and MoE models. Experts are routed gates, not complete projection weights.
-- In these variants, the FFN has gates for up-projection along with experts. We will use these gates as experts, not complete FFNs.
-- Each expert is fetched via router through output vectors of each layer.
-- Number of shared experts are less than experts. Shared expert is pre-fetched by using system prompt from multiple shared experts. This will be refered to as system expert.
+- These will be reasoning and MoE models
+- Made on dense 1.7B and 7B, while the FFN will be broken into experts.
+- 
 
 ---
 
-## For Kaggle Notebook based training
+## For Kaggle Notebook Training.
+
+> The 1.7B model is proof of concept model.
 
 ### Architectural & Parameter Summary (~1.69B Class)
 
@@ -324,14 +327,14 @@ Token injection maintains the continuity of original information, while residual
 1. **Shared Input Embedding ($W_{emb}$)**: $128,256 \times 1,536 \approx \mathbf{0.197\text{ B}}$
 2. **27 Focus Layers**:
    - Projections: $4 \times (1536 \times 2304) \approx 14.16\text{M}$
-   - SwiGLU MLP: $3 \times (1536 \times 6144) \approx 28.31\text{M}$
+   - SwiGLU FFN: $3 \times (1536 \times 6144) \approx 28.31\text{M}$
    - Per Layer: $\approx 42.47\text{M} \implies 27 \times 42.47\text{M} \approx \mathbf{1.147\text{ B}}$
 3. **9 Retention Layers**:
    - Projections ($W_Q, W_{KV}^L, W_K^L, W_V^L, W_O$): $\approx 8.65\text{M}$
-   - SwiGLU MLP: $\approx 28.31\text{M}$
+   - SwiGLU FFN: $\approx 28.31\text{M}$
    - Per Layer: $\approx 36.96\text{M} \implies 9 \times 36.96\text{M} \approx \mathbf{0.333\text{ B}}$
 4. **LoRA De-Embedding Head ($r=128$)**: $(1536 \times 128) + (128 \times 128256) \approx \mathbf{0.017\text{ B}}$
-5. **Total Model Parameters**: $\mathbf{\approx 1.694\text{ Billion Parameters}}$ (~1.7B Model)
+5. **Total Model Parameters**: $\mathbf{\approx 1.694\text{ Billion Parameters}}$ (*~1.7B* Model)
 
 ### Training
 
